@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: alpha-token-bot
+    env: docker
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_CHAT_IDS
+        sync: false
+      - key: WATCH_MODE
+        value: dynamic
