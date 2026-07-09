@@ -2,7 +2,12 @@ services:
   - type: worker
     name: alpha-token-bot
     env: docker
+    plan: starter
     autoDeploy: true
+    disk:
+      name: alpha-token-data
+      mountPath: /app/data
+      sizeGB: 1
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false

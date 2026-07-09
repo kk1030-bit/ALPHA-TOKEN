@@ -113,14 +113,40 @@ def _pair_token_for_symbol(pair: dict[str, Any], symbol: str) -> dict[str, Any] 
     return None
 
 
-def _pair_score(pair: dict[str, Any], symbol: str) -> tuple[int, int, float, float]:
+def _pair_activity(pair: dict[str, Any]) -> tuple[int, float, int, float]:
+    liquidity = _to_float(_nested(pair, "liquidity", "usd")) or 0.0
+    volume_24h = _to_float(_nested(pair, "volume", "h24")) or 0.0
+    volume_1h = _to_float(_nested(pair, "volume", "h1")) or 0.0
+    buys_24h = _to_int(_nested(pair, "txns", "h24", "buys")) or 0
+    sells_24h = _to_int(_nested(pair, "txns", "h24", "sells")) or 0
+    txns_24h = buys_24h + sells_24h
+    score = 0
+    if volume_24h >= 10_000:
+        score += 3
+    elif volume_24h >= 1_000:
+        score += 1
+    if volume_1h >= 1_000:
+        score += 1
+    if txns_24h >= 50:
+        score += 2
+    elif txns_24h >= 10:
+        score += 1
+    if liquidity >= 50_000:
+        score += 1
+    if liquidity >= 100_000 and volume_24h < 10_000:
+        score -= 4
+    if liquidity > 0 and volume_24h / liquidity < 0.001 and txns_24h < 10:
+        score -= 3
+    return score, volume_24h, txns_24h, liquidity
+
+
+def _pair_score(pair: dict[str, Any], symbol: str) -> tuple[int, int, int, float, int, float]:
     base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
     quote = pair.get("quoteToken") if isinstance(pair.get("quoteToken"), dict) else {}
     base_exact = 1 if str(base.get("symbol", "")).upper() == symbol else 0
     quote_exact = 1 if str(quote.get("symbol", "")).upper() == symbol else 0
-    liquidity = _to_float(_nested(pair, "liquidity", "usd")) or 0.0
-    volume_24h = _to_float(_nested(pair, "volume", "h24")) or 0.0
-    return base_exact, quote_exact, volume_24h, liquidity
+    activity, volume_24h, txns_24h, liquidity = _pair_activity(pair)
+    return base_exact, quote_exact, activity, volume_24h, txns_24h, liquidity
 
 
 def search_dex_pair(query_symbol: str) -> dict[str, Any] | None:
@@ -131,7 +157,8 @@ def search_dex_pair(query_symbol: str) -> dict[str, Any] | None:
     if not isinstance(pairs, list):
         return None
     exact_pairs = [pair for pair in pairs if isinstance(pair, dict) and _pair_token_for_symbol(pair, query_symbol)]
-    candidates = exact_pairs or [pair for pair in pairs if isinstance(pair, dict)]
+    active_exact_pairs = [pair for pair in exact_pairs if _pair_activity(pair)[0] > 0]
+    candidates = active_exact_pairs or exact_pairs or [pair for pair in pairs if isinstance(pair, dict)]
     if not candidates:
         return None
     return max(candidates, key=lambda pair: _pair_score(pair, query_symbol))

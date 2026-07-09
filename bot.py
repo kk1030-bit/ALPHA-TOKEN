@@ -49,6 +49,11 @@ SUBSCRIBERS_PATH = ROOT / "data" / "subscribers.json"
 POSITIONS_PATH = ROOT / "data" / "positions.json"
 STRATEGY_POSITIONS_PATH = ROOT / "data" / "strategy_positions.json"
 STRATEGY_EVENTS_PATH = ROOT / "data" / "strategy_events.jsonl"
+WGL_REPORT_EVENTS_PATH = ROOT / "data" / "wgl_reports"
+WGL_SEEN_SYMBOLS_PATH = ROOT / "data" / "wgl_seen_symbols"
+WGL_SYMBOL_STATS_PATH = ROOT / "data" / "wgl_symbol_stats.json"
+WGL_DAILY_SUMMARIES_PATH = ROOT / "data" / "wgl_daily_summaries"
+WGL_DAILY_SUMMARY_STATE_PATH = ROOT / "data" / "wgl_daily_summary_state.json"
 DEFAULT_TOKEN_EXCEL_PATH = ROOT / "tokens.xlsx"
 WATCH_CACHE: dict[str, Any] = {"expires_at": 0.0, "symbols": []}
 RUNTIME_SPIKE_HISTORY: dict[str, deque[dict[str, Any]]] = {}
@@ -611,6 +616,62 @@ def wgl_min_score() -> int:
     return env_int("WGL_MIN_SCORE", 45, 1)
 
 
+def wgl_open_max_rank() -> int:
+    return env_int("WGL_OPEN_MAX_RANK", 2, 1)
+
+
+def wgl_open_min_score() -> int:
+    return env_int("WGL_OPEN_MIN_SCORE", 60, 1)
+
+
+def wgl_ignition_min_score() -> int:
+    return env_int("WGL_IGNITION_MIN_SCORE", 55, 1)
+
+
+def wgl_pullback_min_score() -> int:
+    return env_int("WGL_PULLBACK_MIN_SCORE", 58, 1)
+
+
+def wgl_pullback_min_24h_price_pct() -> float:
+    return env_float("WGL_PULLBACK_MIN_24H_PRICE_PCT", 8.0, 0.0)
+
+
+def wgl_pullback_max_24h_price_pct() -> float:
+    return env_float("WGL_PULLBACK_MAX_24H_PRICE_PCT", 45.0, 1.0)
+
+
+def wgl_pullback_min_6h_range_position_pct() -> float:
+    return env_float("WGL_PULLBACK_MIN_6H_RANGE_POSITION_PCT", 8.0, 0.0)
+
+
+def wgl_pullback_max_6h_range_position_pct() -> float:
+    return env_float("WGL_PULLBACK_MAX_6H_RANGE_POSITION_PCT", 55.0, 1.0)
+
+
+def wgl_pullback_max_funding_pct() -> float:
+    return env_float("WGL_PULLBACK_MAX_FUNDING_PCT", 0.06, 0.0)
+
+
+def wgl_pullback_min_oi_to_mcap_pct() -> float:
+    return env_float("WGL_PULLBACK_MIN_OI_TO_MCAP_PCT", 15.0, 0.0)
+
+
+def wgl_pullback_min_volume_ratio() -> float:
+    return env_float("WGL_PULLBACK_MIN_VOLUME_RATIO", 0.8, 0.0)
+
+
+def wgl_pullback_max_oi_1h_drop_pct() -> float:
+    return env_float("WGL_PULLBACK_MAX_OI_1H_DROP_PCT", -3.0, -100.0)
+
+
+def wgl_daily_summary_hour() -> int:
+    return min(23, env_int("WGL_DAILY_SUMMARY_HOUR", 23, 0))
+
+
+def wgl_daily_summary_minute() -> int:
+    return min(59, env_int("WGL_DAILY_SUMMARY_MINUTE", 59, 0))
+
+
 def orderbook_prune_days() -> int:
     return env_int("ORDERBOOK_PRUNE_DAYS", 7, 1)
 
@@ -1089,6 +1150,247 @@ def save_spike_event(event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def save_wgl_report_event(candidates: list[dict[str, Any]], report_text: str) -> None:
+    WGL_REPORT_EVENTS_PATH.mkdir(parents=True, exist_ok=True)
+    path = WGL_REPORT_EVENTS_PATH / f"{time.strftime('%Y%m%d')}.jsonl"
+    event = {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp_local": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "top_n": len(candidates),
+        "report_text": report_text,
+        "items": [],
+    }
+    for idx, item in enumerate(candidates, 1):
+        row = item.get("row")
+        wgl = item.get("wgl") or {}
+        metrics = item.get("metrics") or {}
+        event["items"].append(
+            {
+                "rank": idx,
+                "report_rank": item.get("report_rank", idx),
+                "symbol": item.get("symbol"),
+                "score": item.get("score"),
+                "labels": item.get("labels"),
+                "reasons": item.get("reasons") or [],
+                "trade_bucket": item.get("trade_bucket"),
+                "trade_decision": item.get("trade_decision"),
+                "trade_setup": item.get("trade_setup"),
+                "trade_reason": item.get("trade_reason"),
+                "first_seen": item.get("first_seen"),
+                "wgl_score": item.get("wgl_score"),
+                "wgl_action": item.get("wgl_action") or wgl.get("action"),
+                "wgl_stage": wgl.get("stage"),
+                "mark_price": to_float(getattr(row, "mark_price", None)),
+                "funding_rate_pct": to_float(getattr(row, "funding_rate_pct", None)),
+                "open_interest": to_float(getattr(row, "open_interest", None)),
+                "oi_value_usd": to_float(getattr(row, "oi_value_usd", None)),
+                "market_rank": getattr(row, "market_rank", None),
+                "marketcap_usd": to_float(getattr(row, "marketcap_usd", None)),
+                "oi_to_marketcap_pct": to_float(metrics.get("oi_to_marketcap_pct")),
+                "price_1h_pct": to_float(metrics.get("price_1h_pct")),
+                "contracts_1h_pct": to_float(metrics.get("contracts_1h_pct")),
+                "wgl_price_24h_pct": to_float(wgl.get("price_24h_pct")),
+                "wgl_oi_1h_pct": to_float(wgl.get("oi_1h_pct")),
+                "wgl_range_6h_position_pct": to_float(wgl.get("range_6h_position_pct")),
+                "wgl_range_24h_position_pct": to_float(wgl.get("range_24h_position_pct")),
+                "wgl_drawdown_from_24h_high_pct": to_float(wgl.get("drawdown_from_24h_high_pct")),
+                "wgl_strong_pullback": bool(wgl.get("strong_pullback")),
+            }
+        )
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def wgl_seen_symbols_path() -> Path:
+    return WGL_SYMBOL_STATS_PATH
+
+
+def local_day_key(ts: float | None = None) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(ts or time.time()))
+
+
+def compact_day_key(day_key: str | None = None) -> str:
+    return (day_key or local_day_key()).replace("-", "")
+
+
+def migrate_legacy_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
+    symbols: dict[str, dict[str, Any]] = {}
+    if not WGL_SEEN_SYMBOLS_PATH.exists():
+        return symbols
+    for path in sorted(WGL_SEEN_SYMBOLS_PATH.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        day_key = str(payload.get("date") or "")
+        if not day_key and len(path.stem) == 8:
+            day_key = f"{path.stem[:4]}-{path.stem[4:6]}-{path.stem[6:8]}"
+        rows = payload.get("symbols", {})
+        if not isinstance(rows, dict):
+            continue
+        for symbol, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            symbol_key = str(symbol).upper()
+            first_seen_local = row.get("first_seen_local") or row.get("first_seen_utc") or day_key
+            record = symbols.setdefault(
+                symbol_key,
+                {
+                    "first_seen_utc": row.get("first_seen_utc"),
+                    "first_seen_local": first_seen_local,
+                    "first_seen_date": day_key,
+                    "first_price": row.get("first_price"),
+                    "first_direction": row.get("first_direction"),
+                    "total_push_count": 0,
+                    "days": {},
+                },
+            )
+            record["total_push_count"] = int(to_float(record.get("total_push_count")) or 0) + int(
+                to_float(row.get("push_count")) or 1
+            )
+            days = record.setdefault("days", {})
+            days[day_key] = {
+                "date": day_key,
+                "first_seen_local": first_seen_local,
+                "last_seen_local": row.get("last_seen_local") or first_seen_local,
+                "first_price": row.get("first_price"),
+                "last_price": row.get("last_price"),
+                "push_count": int(to_float(row.get("push_count")) or 1),
+                "best_score": row.get("score") or row.get("last_score"),
+                "last_score": row.get("last_score") or row.get("score"),
+                "last_trade_bucket": row.get("last_trade_bucket") or row.get("trade_bucket"),
+                "last_trade_decision": row.get("last_trade_decision") or row.get("trade_decision"),
+                "appearances": [],
+            }
+    return symbols
+
+
+def load_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
+    path = wgl_seen_symbols_path()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    else:
+        migrated = migrate_legacy_wgl_seen_symbols()
+        if migrated:
+            save_wgl_seen_symbols(migrated)
+        return migrated
+    if not isinstance(data, dict):
+        return {}
+    symbols = data.get("symbols", {})
+    return symbols if isinstance(symbols, dict) else {}
+
+
+def save_wgl_seen_symbols(seen: dict[str, dict[str, Any]]) -> None:
+    path = wgl_seen_symbols_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "wgl-symbol-stats-v2",
+        "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "updated_local": time.strftime("%Y-%m-%d %H:%M"),
+        "symbols": seen,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def mark_wgl_report_seen(candidates: list[dict[str, Any]], seen: dict[str, dict[str, Any]]) -> None:
+    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now_local = time.strftime("%Y-%m-%d %H:%M")
+    day_key = local_day_key()
+    changed = False
+    for item in candidates:
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        row = item.get("row")
+        mark_price = to_float(getattr(row, "mark_price", None)) or to_float(getattr(row, "price", None))
+        direction = "不開" if item.get("trade_bucket") == "blocked" else "做多"
+        score = int(to_float(item.get("score")) or 0)
+        record = seen.setdefault(
+            symbol,
+            {
+                "first_seen_utc": now_utc,
+                "first_seen_local": now_local,
+                "first_seen_date": day_key,
+                "first_price": mark_price,
+                "first_direction": direction,
+                "total_push_count": 0,
+                "days": {},
+            },
+        )
+        if not record.get("first_seen_date"):
+            record["first_seen_date"] = day_key
+        if record.get("first_price") is None:
+            record["first_price"] = mark_price
+        if not record.get("first_direction"):
+            record["first_direction"] = direction
+
+        record["total_push_count"] = int(
+            to_float(record.get("total_push_count")) or to_float(record.get("push_count")) or 0
+        ) + 1
+        record["last_seen_utc"] = now_utc
+        record["last_seen_local"] = now_local
+        record["last_seen_date"] = day_key
+        record["last_price"] = mark_price
+        record["last_score"] = score
+        record["last_trade_bucket"] = item.get("trade_bucket")
+        record["last_trade_decision"] = item.get("trade_decision")
+        record["last_trade_setup"] = item.get("trade_setup")
+
+        days = record.setdefault("days", {})
+        day = days.setdefault(
+            day_key,
+            {
+                "date": day_key,
+                "first_seen_utc": now_utc,
+                "first_seen_local": now_local,
+                "first_price": mark_price,
+                "push_count": 0,
+                "appearances": [],
+            },
+        )
+        day["push_count"] = int(to_float(day.get("push_count")) or 0) + 1
+        day["last_seen_utc"] = now_utc
+        day["last_seen_local"] = now_local
+        day["last_price"] = mark_price
+        day["last_score"] = score
+        day["last_trade_bucket"] = item.get("trade_bucket")
+        day["last_trade_decision"] = item.get("trade_decision")
+        day["last_trade_setup"] = item.get("trade_setup")
+        day["best_score"] = max(int(to_float(day.get("best_score")) or score), score)
+        day["worst_score"] = min(int(to_float(day.get("worst_score")) or score), score)
+        if mark_price is not None:
+            day["max_price"] = max(to_float(day.get("max_price")) or mark_price, mark_price)
+            day["min_price"] = min(to_float(day.get("min_price")) or mark_price, mark_price)
+
+        appearances = day.setdefault("appearances", [])
+        if isinstance(appearances, list):
+            appearances.append(
+                {
+                    "time_utc": now_utc,
+                    "time_local": now_local,
+                    "report_rank": item.get("report_rank"),
+                    "symbol": symbol,
+                    "score": score,
+                    "wgl_score": item.get("wgl_score"),
+                    "trade_bucket": item.get("trade_bucket"),
+                    "trade_decision": item.get("trade_decision"),
+                    "trade_setup": item.get("trade_setup"),
+                    "trade_reason": item.get("trade_reason"),
+                    "price": mark_price,
+                    "funding_rate_pct": to_float(getattr(row, "funding_rate_pct", None)),
+                    "oi_value_usd": to_float(getattr(row, "oi_value_usd", None)),
+                    "marketcap_usd": to_float(getattr(row, "marketcap_usd", None)),
+                }
+            )
+
+        changed = True
+    if changed:
+        save_wgl_seen_symbols(seen)
 
 
 def classify_spike_regime(price_pct: float | None, contracts_pct: float | None, confirm_pct: float) -> str:
@@ -2319,6 +2621,13 @@ def wgl_recent_context(symbol: str) -> dict[str, Any]:
         "oi_6h_pct": None,
         "oi_24h_pct": None,
         "volume_ratio_3h": None,
+        "range_6h_low": None,
+        "range_6h_high": None,
+        "range_6h_position_pct": None,
+        "range_24h_low": None,
+        "range_24h_high": None,
+        "range_24h_position_pct": None,
+        "drawdown_from_24h_high_pct": None,
         "funding_rates_pct": [],
         "errors": [],
     }
@@ -2326,10 +2635,26 @@ def wgl_recent_context(symbol: str) -> dict[str, Any]:
     try:
         klines = get_klines(symbol, interval="1h", limit=30)
         closes = [kline_float(row, 4) for row in klines]
+        highs = [kline_float(row, 2) for row in klines]
+        lows = [kline_float(row, 3) for row in klines]
         quote_volumes = [kline_float(row, 7) for row in klines]
         context["price_1h_pct"] = pct_from_tail(closes, 1)
         context["price_6h_pct"] = pct_from_tail(closes, 6)
         context["price_24h_pct"] = pct_from_tail(closes, 24)
+        last_close = closes[-1] if closes else None
+        for label, lookback in (("6h", 6), ("24h", 24)):
+            recent_highs = [value for value in highs[-lookback:] if value is not None]
+            recent_lows = [value for value in lows[-lookback:] if value is not None]
+            if last_close is not None and recent_highs and recent_lows:
+                range_low = min(recent_lows)
+                range_high = max(recent_highs)
+                context[f"range_{label}_low"] = range_low
+                context[f"range_{label}_high"] = range_high
+                if range_high > range_low:
+                    context[f"range_{label}_position_pct"] = (last_close - range_low) / (range_high - range_low) * 100.0
+        range_24h_high = to_float(context.get("range_24h_high"))
+        if last_close is not None and range_24h_high is not None and range_24h_high > 0:
+            context["drawdown_from_24h_high_pct"] = (range_24h_high - last_close) / range_24h_high * 100.0
         recent_volume = avg_clean(quote_volumes[-3:])
         base_volume = list_median([value for value in quote_volumes[-24:-3] if value is not None])
         if recent_volume is not None and base_volume is not None and base_volume > 0:
@@ -2573,6 +2898,20 @@ def wgl_stage_candidate(
     oi_24h = to_float(context.get("oi_24h_pct"))
     volume_ratio = to_float(context.get("volume_ratio_3h"))
     oi_to_mcap = metrics.get("oi_to_marketcap_pct")
+    current_price = to_float(getattr(row, "mark_price", None)) or to_float(getattr(row, "price", None))
+    range_6h_low = to_float(context.get("range_6h_low"))
+    range_6h_high = to_float(context.get("range_6h_high"))
+    range_24h_low = to_float(context.get("range_24h_low"))
+    range_24h_high = to_float(context.get("range_24h_high"))
+    range_6h_position = to_float(context.get("range_6h_position_pct"))
+    range_24h_position = to_float(context.get("range_24h_position_pct"))
+    drawdown_from_24h_high = to_float(context.get("drawdown_from_24h_high_pct"))
+    if current_price is not None and range_6h_low is not None and range_6h_high is not None and range_6h_high > range_6h_low:
+        range_6h_position = (current_price - range_6h_low) / (range_6h_high - range_6h_low) * 100.0
+    if current_price is not None and range_24h_low is not None and range_24h_high is not None and range_24h_high > range_24h_low:
+        range_24h_position = (current_price - range_24h_low) / (range_24h_high - range_24h_low) * 100.0
+    if current_price is not None and range_24h_high is not None and range_24h_high > 0:
+        drawdown_from_24h_high = (range_24h_high - current_price) / range_24h_high * 100.0
 
     recent_rates = funding_rates[-6:]
     negative_count = sum(1 for value in recent_rates if value < 0)
@@ -2617,9 +2956,32 @@ def wgl_stage_candidate(
     )
     oi_fading_with_price_hold = oi_1h is not None and oi_1h <= -2.0 and price_1h is not None and price_1h >= 0
     short_side_winning = oi_1h is not None and oi_1h >= 3.0 and price_1h is not None and price_1h <= -1.5
+    pullback_price_started = (
+        price_24h is not None
+        and wgl_pullback_min_24h_price_pct() <= price_24h <= wgl_pullback_max_24h_price_pct()
+    )
+    pullback_range_ok = (
+        range_6h_position is not None
+        and wgl_pullback_min_6h_range_position_pct() <= range_6h_position <= wgl_pullback_max_6h_range_position_pct()
+    )
+    pullback_funding_ok = current_funding is not None and abs(current_funding) <= wgl_pullback_max_funding_pct()
+    pullback_oi_mcap_ok = (
+        oi_to_mcap is not None
+        and wgl_pullback_min_oi_to_mcap_pct() <= oi_to_mcap <= strategy_max_oi_to_mcap_pct()
+    )
+    pullback_oi_ok = oi_1h is None or oi_1h >= wgl_pullback_max_oi_1h_drop_pct()
+    pullback_volume_ok = volume_ratio is None or volume_ratio >= wgl_pullback_min_volume_ratio()
+    strong_pullback = bool(
+        pullback_price_started
+        and pullback_range_ok
+        and pullback_funding_ok
+        and pullback_oi_mcap_ok
+        and pullback_oi_ok
+        and pullback_volume_ok
+    )
     price_stretched = (
-        (price_24h is not None and price_24h >= 35.0)
-        or (price_6h is not None and price_6h >= 25.0)
+        (price_24h is not None and price_24h >= 35.0 and not strong_pullback)
+        or (price_6h is not None and price_6h >= 25.0 and not strong_pullback)
         or funding_positive_hot
     )
 
@@ -2671,6 +3033,15 @@ def wgl_stage_candidate(
     if volume_ratio is not None and volume_ratio >= 1.5:
         score += 8
         reasons.append(f"3H量能 x{volume_ratio:.2f}")
+    if strong_pullback:
+        score += 30
+        reasons.append(
+            f"BLESS型回踩：24h {fmt_pct(price_24h)}、6H位階{fmt_pct(range_6h_position)}、"
+            f"OI/市值{fmt_pct(oi_to_mcap)}、funding {fmt_pct(current_funding, 4)}"
+        )
+    elif pullback_price_started and pullback_range_ok:
+        score += 8
+        reasons.append(f"強勢回踩觀察：24h {fmt_pct(price_24h)}、6H位階{fmt_pct(range_6h_position)}")
 
     if book_absorption:
         score += 22
@@ -2716,6 +3087,9 @@ def wgl_stage_candidate(
     if hard_exit:
         stage = "尾端/派發"
         action = "不要進"
+    elif strong_pullback:
+        stage = "強勢回踩"
+        action = "埋伏" if score >= wgl_pullback_min_score() else "再確認偏強"
     elif squeeze_like:
         stage = "軋空啟動"
         action = "再確認偏強" if score >= 55 else "再確認"
@@ -2745,6 +3119,10 @@ def wgl_stage_candidate(
         "oi_6h_pct": oi_6h,
         "price_24h_pct": price_24h,
         "oi_24h_pct": oi_24h,
+        "range_6h_position_pct": range_6h_position,
+        "range_24h_position_pct": range_24h_position,
+        "drawdown_from_24h_high_pct": drawdown_from_24h_high,
+        "strong_pullback": strong_pullback,
         "funding_rates_pct": funding_rates,
         "context_errors": context.get("errors") or [],
     }
@@ -2870,6 +3248,7 @@ def composite_candidate_rows(
                 "row": row,
                 "metrics": metrics,
                 "wgl": wgl,
+                "book": book,
                 "wgl_score": int(wgl.get("score") or 0) if wgl else 0,
                 "wgl_action": str(wgl.get("action") or "") if wgl else "",
             }
@@ -2886,6 +3265,420 @@ def composite_candidate_rows(
         reverse=True,
     )
     return output
+
+
+def short_text(value: str, limit: int = 70) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def first_signal_reason(item: dict[str, Any]) -> str:
+    for reason in item.get("reasons") or []:
+        text = str(reason)
+        if text.startswith("風險："):
+            continue
+        if "｜" in text:
+            parts = [part for part in text.split("｜") if part]
+            text = parts[-1] if parts else text
+        return short_text(text, 64)
+    return "等下一根價格/OI確認"
+
+
+def classify_wgl_trade_item(
+    item: dict[str, Any],
+    report_rank: int,
+    seen: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    symbol = str(item.get("symbol") or "").upper()
+    first_seen = seen.get(symbol) or {}
+
+    row = item.get("row")
+    wgl = item.get("wgl") or {}
+    metrics = item.get("metrics") or {}
+    score = int(item.get("score") or 0)
+    stage_text = " ".join(
+        str(value)
+        for value in [
+            item.get("labels"),
+            wgl.get("stage"),
+            wgl.get("action"),
+        ]
+        if value
+    )
+    risk_parts = [str(risk) for risk in wgl.get("risks") or []]
+    risk_parts.extend(str(reason) for reason in item.get("reasons") or [] if str(reason).startswith("風險"))
+    risk_text = "；".join(risk_parts)
+    funding = to_float(getattr(row, "funding_rate_pct", None))
+    hard_risk = (
+        str(wgl.get("action") or "") == "不要進"
+        or any(keyword in risk_text for keyword in ["派發", "偏熱", "OI 1H轉負", "疑似空方", "偏伸"])
+        or (funding is not None and funding >= 0.10)
+    )
+    if hard_risk:
+        return {
+            "trade_bucket": "blocked",
+            "trade_decision": "不要進",
+            "trade_setup": "風險過高",
+            "trade_reason": short_text(risk_text or "出現派發/過熱/OI轉弱風險"),
+            "first_seen": first_seen or None,
+        }
+
+    is_pullback_setup = "強勢回踩" in stage_text
+    is_structure_setup = any(keyword in stage_text for keyword in ["底部", "起漲", "強勢回踩"])
+    wgl_score = int(wgl.get("score") or 0)
+    notice_label = "再次出現" if first_seen else "首次通知"
+    if report_rank <= wgl_open_max_rank() and is_pullback_setup and wgl_score >= wgl_pullback_min_score():
+        return {
+            "trade_bucket": "open",
+            "trade_decision": "可開單",
+            "trade_setup": "A2回踩",
+            "trade_reason": f"{notice_label}｜排名{report_rank}｜WGL{wgl_score}分｜{first_signal_reason(item)}",
+            "first_seen": first_seen or None,
+        }
+    if report_rank <= wgl_open_max_rank() and score >= wgl_open_min_score() and is_structure_setup:
+        return {
+            "trade_bucket": "open",
+            "trade_decision": "可開單",
+            "trade_setup": "A2回踩" if is_pullback_setup else "A結構",
+            "trade_reason": f"{notice_label}｜排名{report_rank}｜分數{score}｜{first_signal_reason(item)}",
+            "first_seen": first_seen or None,
+        }
+
+    price_1h = to_float(wgl.get("price_1h_pct"))
+    if price_1h is None:
+        price_1h = to_float(metrics.get("price_1h_pct"))
+    oi_1h = to_float(wgl.get("oi_1h_pct"))
+    if oi_1h is None:
+        oi_1h = to_float(metrics.get("contracts_1h_pct"))
+    price_oi_sync = price_1h is not None and oi_1h is not None and price_1h > 0 and oi_1h > 0
+    ignition_like = (
+        "軋空" in stage_text
+        or "起漲確認" in stage_text
+        or str(wgl.get("action") or "") == "再確認偏強"
+        or price_oi_sync
+    )
+    if score >= wgl_ignition_min_score() and ignition_like:
+        return {
+            "trade_bucket": "confirm",
+            "trade_decision": "待確認",
+            "trade_setup": "B點火",
+            "trade_reason": "等5-15分鐘：突破警報高點且價/OI續增才開",
+            "first_seen": first_seen or None,
+        }
+
+    if report_rank > wgl_open_max_rank():
+        reason = f"排名{report_rank}超過開單區，只觀察"
+    elif score < wgl_open_min_score():
+        reason = f"分數{score}低於可開門檻{wgl_open_min_score()}"
+    else:
+        reason = "條件未完整，等下一次確認"
+    return {
+        "trade_bucket": "observe",
+        "trade_decision": "觀察",
+        "trade_setup": "雷達",
+        "trade_reason": reason,
+        "first_seen": first_seen or None,
+    }
+
+
+def format_wgl_compact_line(index: int, item: dict[str, Any]) -> str:
+    row = item["row"]
+    rank = f"#{row.market_rank}" if row.market_rank else "#n/a"
+    oi_to_mcap = item["metrics"].get("oi_to_marketcap_pct")
+    return (
+        f"{index}. {item['symbol']}｜{item['score']}分｜{item.get('trade_setup')}｜{rank}｜"
+        f"MC ${fmt_num(row.marketcap_usd)}｜OI/MC {fmt_pct(oi_to_mcap)}"
+    )
+
+
+def compact_card_time(value: Any | None = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return time.strftime("%m/%d %H:%M")
+    if "T" in text:
+        date_part, time_part = text.split("T", 1)
+        text = f"{date_part} {time_part[:5]}"
+    if len(text) >= 16 and text[4] == "-" and text[7] == "-":
+        return f"{text[5:7]}/{text[8:10]} {text[11:16]}"
+    return text
+
+
+def wgl_card_grade(score: int) -> str:
+    if score >= 90:
+        return "S級"
+    if score >= 75:
+        return "A級"
+    if score >= 60:
+        return "B級"
+    return "C級"
+
+
+def wgl_card_risk(item: dict[str, Any]) -> str:
+    row = item.get("row")
+    funding = to_float(getattr(row, "funding_rate_pct", None))
+    bucket = str(item.get("trade_bucket") or "")
+    if bucket == "blocked" or (funding is not None and funding >= 0.10):
+        return "極高"
+    if bucket in {"open", "confirm"} or int(item.get("score") or 0) >= 75:
+        return "高"
+    return "中"
+
+
+def wgl_card_mode(item: dict[str, Any]) -> str:
+    bucket = str(item.get("trade_bucket") or "")
+    if bucket == "blocked":
+        return "不要進"
+    if bucket == "confirm":
+        return "做多待確認"
+    if bucket == "observe":
+        return "做多觀察"
+    return "做多"
+
+
+def wgl_card_seen_state(item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    symbol = str(item.get("symbol") or "").upper()
+    row = item.get("row")
+    current_price = to_float(getattr(row, "mark_price", None)) or to_float(getattr(row, "price", None))
+    first_seen = seen.get(symbol) or item.get("first_seen") or {}
+    has_seen = bool(first_seen)
+    stored_count = int(
+        to_float(first_seen.get("total_push_count")) or to_float(first_seen.get("push_count")) or (1 if has_seen else 0)
+    )
+    push_count = stored_count + 1 if has_seen else 1
+    first_time = first_seen.get("first_seen_local") or first_seen.get("first_seen_utc") or time.strftime("%Y-%m-%d %H:%M")
+    first_price = to_float(first_seen.get("first_price")) or current_price
+    direction = str(first_seen.get("first_direction") or wgl_card_mode(item))
+    return {
+        "push_count": push_count,
+        "first_time": compact_card_time(first_time),
+        "latest_time": compact_card_time(),
+        "first_price": first_price,
+        "current_price": current_price,
+        "direction": direction,
+    }
+
+
+def wgl_card_signal_counts(item: dict[str, Any]) -> tuple[int, int]:
+    metrics = item.get("metrics") or {}
+    wgl = item.get("wgl") or {}
+    book = item.get("book")
+    price_1h = to_float(wgl.get("price_1h_pct")) or to_float(metrics.get("price_1h_pct"))
+    oi_1h = to_float(wgl.get("oi_1h_pct")) or to_float(metrics.get("contracts_1h_pct"))
+    price_180s = to_float(metrics.get("price_180s_pct"))
+    oi_180s = to_float(metrics.get("contracts_180s_pct"))
+    price_24h = to_float(wgl.get("price_24h_pct"))
+    oi_24h = to_float(wgl.get("oi_24h_pct"))
+    oi_to_mcap = to_float(metrics.get("oi_to_marketcap_pct"))
+
+    short_count = sum(
+        1
+        for ok in [
+            price_180s is not None and price_180s > 0,
+            oi_180s is not None and oi_180s > 0,
+            price_1h is not None and price_1h > 0,
+            oi_1h is not None and oi_1h > 0,
+            bool(book and getattr(book, "score", 0) >= orderbook_min_score()),
+        ]
+        if ok
+    )
+    trend_count = sum(
+        1
+        for ok in [
+            price_24h is not None and price_24h > 0,
+            oi_24h is not None and oi_24h > 0,
+            oi_to_mcap is not None and oi_to_mcap >= wgl_pullback_min_oi_to_mcap_pct(),
+            bool(wgl.get("strong_pullback")),
+            any(key in str(item.get("labels") or "") for key in ["底部", "起漲", "強勢回踩"]),
+        ]
+        if ok
+    )
+    return short_count, trend_count
+
+
+def wgl_card_reasons(item: dict[str, Any]) -> str:
+    metrics = item.get("metrics") or {}
+    wgl = item.get("wgl") or {}
+    tags: list[str] = []
+    setup = str(item.get("trade_setup") or "")
+    score = int(item.get("score") or 0)
+    wgl_score = int(item.get("wgl_score") or wgl.get("score") or 0)
+    price_1h = to_float(wgl.get("price_1h_pct")) or to_float(metrics.get("price_1h_pct"))
+    oi_1h = to_float(wgl.get("oi_1h_pct")) or to_float(metrics.get("contracts_1h_pct"))
+
+    if setup:
+        tags.append(setup)
+    if score >= 100:
+        tags.append("100分以上")
+    if score >= wgl_open_min_score():
+        tags.append("資金分達標")
+    if wgl_score >= wgl_min_score():
+        tags.append("WGL達標")
+    if wgl.get("strong_pullback"):
+        tags.append("強勢回踩")
+    if price_1h is not None and oi_1h is not None and price_1h > 0 and oi_1h > 0:
+        tags.append("1H動能達標")
+        if price_1h >= 2 and oi_1h >= 2:
+            tags.append("1H強爆發")
+    tags.append(first_signal_reason(item))
+
+    output: list[str] = []
+    for tag in tags:
+        clean = short_text(str(tag), 34)
+        if clean and clean not in output:
+            output.append(clean)
+    return " / ".join(output)
+
+
+def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> str:
+    row = item["row"]
+    metrics = item.get("metrics") or {}
+    wgl = item.get("wgl") or {}
+    state = wgl_card_seen_state(item, seen)
+    score = int(item.get("score") or 0)
+    wgl_score = int(item.get("wgl_score") or wgl.get("score") or score)
+    grade = wgl_card_grade(score)
+    first_price = to_float(state.get("first_price"))
+    current_price = to_float(state.get("current_price"))
+    move_pct = pct_change(current_price, first_price)
+    up_pct = max(move_pct or 0.0, 0.0)
+    down_pct = max(-(move_pct or 0.0), 0.0)
+    sentiment = max(0.0, min(100.0, float(score)))
+    marketcap = to_float(getattr(row, "marketcap_usd", None))
+    short_count, trend_count = wgl_card_signal_counts(item)
+
+    return "\n".join(
+        [
+            "🟡 資金異動",
+            "",
+            f"幣種：{item['symbol']}",
+            f"分數：{score}/100",
+            f"品質：{grade}",
+            f"風險：{wgl_card_risk(item)}",
+            f"模式：{wgl_card_mode(item)}",
+            f"妖幣欄位：{grade}妖幣快打 | 分數 {wgl_score} | 第 {state['push_count']} 次",
+            f"妖幣原因：{wgl_card_reasons(item)}",
+            f"#：{index}",
+            f"首次推送：{state['first_time']}",
+            f"首訊方向：{state['direction']}",
+            f"最新推送：{state['latest_time']}",
+            f"推送價格($)：{fmt_num(first_price, 6)}",
+            f"當前幣價($)：{fmt_num(current_price, 6)}",
+            f"推送後漲幅：{up_pct:.2f}%",
+            f"推送後跌幅：{down_pct:.2f}%",
+            f"看漲情緒：{sentiment:.2f}%",
+            "全部：合約",
+            f"市值：{'-' if marketcap is None else '$' + fmt_num(marketcap)}",
+            f"短線異動：{short_count}",
+            f"趨勢異動：{trend_count}",
+        ]
+    )
+
+
+def wgl_daily_summary_path(day_key: str | None = None) -> Path:
+    return WGL_DAILY_SUMMARIES_PATH / f"{compact_day_key(day_key)}.json"
+
+
+def load_wgl_daily_summary_state() -> dict[str, Any]:
+    if not WGL_DAILY_SUMMARY_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(WGL_DAILY_SUMMARY_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_wgl_daily_summary_state(state: dict[str, Any]) -> None:
+    WGL_DAILY_SUMMARY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WGL_DAILY_SUMMARY_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def wgl_daily_summary_due(state: dict[str, Any]) -> bool:
+    now = time.localtime()
+    if now.tm_hour != wgl_daily_summary_hour() or now.tm_min < wgl_daily_summary_minute():
+        return False
+    return state.get("last_sent_date") != local_day_key()
+
+
+def wgl_summary_time(value: Any) -> str:
+    if value is None or str(value).strip() == "":
+        return "-"
+    text = compact_card_time(value)
+    return text[-5:] if len(text) >= 5 else text
+
+
+def build_wgl_daily_summary(day_key: str | None = None) -> str:
+    day_key = day_key or local_day_key()
+    stats = load_wgl_seen_symbols()
+    items: list[dict[str, Any]] = []
+    for symbol, record in stats.items():
+        if not isinstance(record, dict):
+            continue
+        days = record.get("days") if isinstance(record.get("days"), dict) else {}
+        day = days.get(day_key)
+        if not isinstance(day, dict):
+            continue
+        first_price = to_float(day.get("first_price")) or to_float(record.get("first_price"))
+        last_price = to_float(day.get("last_price")) or to_float(record.get("last_price"))
+        items.append(
+            {
+                "symbol": symbol,
+                "push_count": int(to_float(day.get("push_count")) or 0),
+                "first_seen_local": day.get("first_seen_local"),
+                "last_seen_local": day.get("last_seen_local"),
+                "first_price": first_price,
+                "last_price": last_price,
+                "change_pct": pct_change(last_price, first_price),
+                "best_score": int(to_float(day.get("best_score")) or to_float(day.get("last_score")) or 0),
+                "worst_score": int(to_float(day.get("worst_score")) or to_float(day.get("last_score")) or 0),
+                "last_score": int(to_float(day.get("last_score")) or 0),
+                "last_trade_decision": day.get("last_trade_decision") or "-",
+                "last_trade_setup": day.get("last_trade_setup") or "-",
+                "appearances": day.get("appearances") if isinstance(day.get("appearances"), list) else [],
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            item["best_score"],
+            item["push_count"],
+            item["change_pct"] if item["change_pct"] is not None else -9999,
+            item["symbol"],
+        ),
+        reverse=True,
+    )
+
+    summary_path = wgl_daily_summary_path(day_key)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "date": day_key,
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "generated_local": time.strftime("%Y-%m-%d %H:%M"),
+        "symbol_count": len(items),
+        "total_appearances": sum(item["push_count"] for item in items),
+        "items": items,
+    }
+    summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    day_label = day_key.replace("-", "/")
+    lines = [
+        f"每日資金異動統計｜{day_label}",
+        f"出現標的：{len(items)}｜總出現次數：{payload['total_appearances']}",
+        "規則：重複標的保留，只統計當天強弱變化。",
+    ]
+    if not items:
+        lines.append("今日尚未記錄到 WGL TOP 標的。")
+    else:
+        for idx, item in enumerate(items, 1):
+            lines.append(
+                f"{idx}. {item['symbol']}｜出現 {item['push_count']} 次｜"
+                f"{wgl_summary_time(item.get('first_seen_local'))}-{wgl_summary_time(item.get('last_seen_local'))}｜"
+                f"最佳{item['best_score']}分｜最後{item['last_trade_decision']}/{item['last_trade_setup']}｜"
+                f"漲跌 {fmt_pct(item['change_pct'])}"
+            )
+    lines.append(f"已存檔：{summary_path}")
+    return "\n".join(lines)
 
 
 def orderbook_collection_symbols(history: dict[str, deque[dict[str, Any]]] | None = None) -> list[str]:
@@ -3053,55 +3846,56 @@ def build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]] | None
         wgl_rows,
     )
 
-    lines = [
-        "每小時妖幣劇本雷達｜WGL綜合前五",
-        (
-            f"掃描：OI注意力前 {len(ranked)} 檔｜鏈上門檻 {strategy_onchain_min_score():+d}"
-            f"｜完整結構前 {structure_scan_candidate_count()} 檔｜底部 {ravelab_min_score()}分"
-            f"｜起漲 {launch_min_score()}分｜訂單簿 {orderbook_min_score()}分｜WGL {wgl_min_score()}分"
-        ),
-        (
-            "只列綜合前五；優先看 funding 階段、價格/OI同步、訂單簿吸籌，再合併底部/起漲、鏈上與OI/市值。"
-            "單幣細節用 /thesis SYMBOL 或 /orderbook SYMBOL。"
-        ),
-    ]
-
     bullish = [item for item in onchain_rows if item["signal"].score >= strategy_onchain_min_score()]
     warning = [
         item
         for item in onchain_rows
         if item["signal"].score < strategy_onchain_min_score() and item["signal"].reasons
     ]
+    seen_symbols = load_wgl_seen_symbols()
+    report_rows: list[dict[str, Any]] = []
+    for idx, raw_item in enumerate(composite_rows[:composite_report_top_n()], 1):
+        item = dict(raw_item)
+        item["report_rank"] = idx
+        item.update(classify_wgl_trade_item(item, idx, seen_symbols))
+        report_rows.append(item)
 
-    lines.append("")
-    lines.append("【WGL綜合前五｜可研究名單】")
-    if composite_rows:
-        for idx, item in enumerate(composite_rows[:composite_report_top_n()], 1):
-            row = item["row"]
-            rank = f"#{row.market_rank}" if row.market_rank else "#n/a"
-            wgl = item.get("wgl") or {}
-            action = wgl.get("action") or "再確認"
-            stage = wgl.get("stage") or item["labels"]
-            lines.append(
-                f"{idx}. {item['symbol']}｜{item['score']}分｜{action}｜{stage}｜{rank}｜"
-                f"市值 ${fmt_num(row.marketcap_usd)}｜OI ${fmt_num(row.oi_value_usd)}"
-            )
-            lines.append(f"理由：{'；'.join(item['reasons'])}")
+    open_rows = [item for item in report_rows if item.get("trade_bucket") == "open"]
+    confirm_rows = [item for item in report_rows if item.get("trade_bucket") == "confirm"]
+    observe_rows = [item for item in report_rows if item.get("trade_bucket") == "observe"]
+    duplicate_rows = [item for item in report_rows if item.get("trade_bucket") == "duplicate"]
+    blocked_rows = [item for item in report_rows if item.get("trade_bucket") == "blocked"]
+    new_rows = [item for item in report_rows if item.get("trade_bucket") != "duplicate"]
+
+    lines: list[str] = []
+    if report_rows:
+        for idx, item in enumerate(report_rows, 1):
+            if idx > 1:
+                lines.append("")
+                lines.append("-----")
+                lines.append("")
+            lines.append(format_wgl_funding_card(idx, item, seen_symbols))
     else:
-        lines.append("目前沒有足夠明確的綜合候選。")
+        lines.append("🟡 資金異動")
+        lines.append("")
+        lines.append("目前沒有足夠明確的 TOP 5 候選。")
 
     strong_books = [item for item in orderbook_ready if item["signal"].score >= orderbook_min_score()]
     lines.append("")
     lines.append(
         "摘要："
-        f"WGL達標 {len(wgl_rows)}｜底部 {len(ravelab_rows)}｜起漲 {len(launch_rows)}｜"
-        f"訂單簿達標 {len(strong_books)}｜鏈上偏多 {len(bullish)}｜鏈上警戒 {len(warning)}"
+        f"掃描 {len(ranked)}｜新 {len(new_rows)}｜可開 {len(open_rows)}｜待確認 {len(confirm_rows)}｜"
+        f"重複/不開 {len(duplicate_rows) + len(blocked_rows)}｜WGL {len(wgl_rows)}｜"
+        f"訂單簿 {len(strong_books)}｜鏈上偏多 {len(bullish)}"
     )
     if orderbook_enabled() and orderbook_rows and not orderbook_ready:
         best = orderbook_rows[0]["signal"]
         lines.append(f"訂單簿資料累積中：最佳 {best.symbol} 快照 {best.snapshot_count}/{orderbook_min_snapshots()}。")
 
-    return "\n".join(lines)
+    report_text = "\n".join(lines)
+    save_wgl_report_event(report_rows, report_text)
+    mark_wgl_report_seen(report_rows, seen_symbols)
+    return report_text
 
 
 def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, Any]]] | None = None) -> str:
@@ -3855,6 +4649,7 @@ def run_bot() -> None:
     position_history = RUNTIME_POSITION_HISTORY
     last_spike_alert_at: dict[str, float] = {}
     last_strategy_signal_at: dict[str, float] = {}
+    daily_summary_state = load_wgl_daily_summary_state()
     print("OI bot polling started. Press Ctrl+C to stop.", flush=True)
     while True:
         try:
@@ -3928,6 +4723,24 @@ def run_bot() -> None:
                         except Exception as exc:
                             print(f"On-chain report send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 next_onchain_report_at = time.time() + onchain_report_interval_seconds()
+
+            if wgl_daily_summary_due(daily_summary_state):
+                summary_day = local_day_key()
+                try:
+                    summary = build_wgl_daily_summary(summary_day)
+                except Exception as exc:
+                    summary = f"每日資金異動統計失敗：{exc}"
+                    print(f"WGL daily summary error: {exc}", file=sys.stderr, flush=True)
+                subscribers = load_subscribers()
+                for chat_id in subscribers:
+                    try:
+                        send_long_message(token, int(chat_id), summary)
+                    except Exception as exc:
+                        print(f"WGL daily summary send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
+                daily_summary_state["last_sent_date"] = summary_day
+                daily_summary_state["last_sent_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                daily_summary_state["last_sent_local"] = time.strftime("%Y-%m-%d %H:%M")
+                save_wgl_daily_summary_state(daily_summary_state)
 
             if time.time() >= next_position_check_at:
                 try:
