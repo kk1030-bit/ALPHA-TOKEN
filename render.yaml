@@ -17,3 +17,5 @@ services:
         value: dynamic
       - key: TZ
         value: Asia/Taipei
+      - key: WGL_STATS_START_DATE
+        value: 2026-07-09

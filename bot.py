@@ -672,6 +672,27 @@ def wgl_daily_summary_minute() -> int:
     return min(59, env_int("WGL_DAILY_SUMMARY_MINUTE", 59, 0))
 
 
+def normalize_day_string(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    if " " in text:
+        text = text.split(" ", 1)[0]
+    text = text.replace("/", "-")
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    parts = text.split("-")
+    if len(parts) == 3 and all(part.isdigit() for part in parts):
+        return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+    return text
+
+
+def wgl_stats_start_date() -> str:
+    return normalize_day_string(os.environ.get("WGL_STATS_START_DATE", "2026-07-09"))
+
+
 def orderbook_prune_days() -> int:
     return env_int("ORDERBOOK_PRUNE_DAYS", 7, 1)
 
@@ -1217,6 +1238,7 @@ def compact_day_key(day_key: str | None = None) -> str:
 
 def migrate_legacy_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
     symbols: dict[str, dict[str, Any]] = {}
+    start_date = wgl_stats_start_date()
     if not WGL_SEEN_SYMBOLS_PATH.exists():
         return symbols
     for path in sorted(WGL_SEEN_SYMBOLS_PATH.glob("*.json")):
@@ -1227,6 +1249,9 @@ def migrate_legacy_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
         day_key = str(payload.get("date") or "")
         if not day_key and len(path.stem) == 8:
             day_key = f"{path.stem[:4]}-{path.stem[4:6]}-{path.stem[6:8]}"
+        day_key = normalize_day_string(day_key)
+        if start_date and day_key and day_key < start_date:
+            continue
         rows = payload.get("symbols", {})
         if not isinstance(rows, dict):
             continue
@@ -1267,6 +1292,52 @@ def migrate_legacy_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
     return symbols
 
 
+def normalize_wgl_symbol_stats(symbols: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    start_date = wgl_stats_start_date()
+    if not start_date:
+        return symbols
+    normalized: dict[str, dict[str, Any]] = {}
+    for symbol, raw_record in symbols.items():
+        if not isinstance(raw_record, dict):
+            continue
+        days_raw = raw_record.get("days") if isinstance(raw_record.get("days"), dict) else {}
+        days: dict[str, dict[str, Any]] = {}
+        for raw_day_key, raw_day in days_raw.items():
+            day_key = normalize_day_string(raw_day_key or (raw_day or {}).get("date"))
+            if not day_key or day_key < start_date or not isinstance(raw_day, dict):
+                continue
+            day = dict(raw_day)
+            day["date"] = day_key
+            days[day_key] = day
+        if not days:
+            continue
+        first_day_key = min(days)
+        last_day_key = max(days)
+        first_day = days[first_day_key]
+        last_day = days[last_day_key]
+        record = dict(raw_record)
+        record["days"] = days
+        record["first_seen_date"] = first_day_key
+        record["first_seen_utc"] = first_day.get("first_seen_utc") or first_day.get("last_seen_utc")
+        record["first_seen_local"] = first_day.get("first_seen_local") or first_day.get("last_seen_local") or first_day_key
+        record["first_price"] = to_float(first_day.get("first_price")) or to_float(first_day.get("last_price"))
+        record["first_direction"] = raw_record.get("first_direction") or "做多"
+        record["last_seen_date"] = last_day_key
+        record["last_seen_utc"] = last_day.get("last_seen_utc") or last_day.get("first_seen_utc")
+        record["last_seen_local"] = last_day.get("last_seen_local") or last_day.get("first_seen_local")
+        record["last_price"] = to_float(last_day.get("last_price")) or to_float(last_day.get("first_price"))
+        record["last_score"] = last_day.get("last_score") or last_day.get("best_score")
+        record["last_trade_bucket"] = last_day.get("last_trade_bucket")
+        record["last_trade_decision"] = last_day.get("last_trade_decision")
+        record["last_trade_setup"] = last_day.get("last_trade_setup")
+        record["total_push_count"] = sum(
+            int(to_float(day.get("push_count")) or len(day.get("appearances") or []) or 0)
+            for day in days.values()
+        )
+        normalized[str(symbol).upper()] = record
+    return normalized
+
+
 def load_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
     path = wgl_seen_symbols_path()
     if path.exists():
@@ -1278,11 +1349,11 @@ def load_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
         migrated = migrate_legacy_wgl_seen_symbols()
         if migrated:
             save_wgl_seen_symbols(migrated)
-        return migrated
+        return normalize_wgl_symbol_stats(migrated)
     if not isinstance(data, dict):
         return {}
     symbols = data.get("symbols", {})
-    return symbols if isinstance(symbols, dict) else {}
+    return normalize_wgl_symbol_stats(symbols) if isinstance(symbols, dict) else {}
 
 
 def save_wgl_seen_symbols(seen: dict[str, dict[str, Any]]) -> None:

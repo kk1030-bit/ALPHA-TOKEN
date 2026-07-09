@@ -27,7 +27,7 @@ The hourly WGL report now prints each top candidate as a `資金異動` card:
 
 The underlying decisions are still tracked as `可開單`, `待確認`, `觀察`, and `不要進`; repeated symbols remain eligible and are shown through the card's history counters.
 
-Duplicate symbols are no longer filtered out of `/report`. The bot keeps permanent symbol statistics and also records each date on which a symbol appears. At `23:59` local time it writes and sends a daily summary for every symbol that appeared that day.
+Duplicate symbols are no longer filtered out of `/report`. The bot keeps permanent symbol statistics and also records each date on which a symbol appears. The first-push baseline starts at `WGL_STATS_START_DATE` (`2026-07-09` by default), so older legacy appearances are ignored. At `23:59` local time it writes and sends a daily summary for every symbol that appeared that day.
 
 Default trade-management assumptions: TP +10% take half, SL -7%, then move stop to entry after half take-profit.
 
