@@ -15,3 +15,5 @@ services:
         sync: false
       - key: WATCH_MODE
         value: dynamic
+      - key: TZ
+        value: Asia/Taipei
