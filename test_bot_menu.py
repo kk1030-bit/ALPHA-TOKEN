@@ -148,6 +148,34 @@ class OiTrendSignalTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def test_low_turnover_blocks_oi_trend_alert(self) -> None:
+        result = bot.classify_oi_trend_signal(
+            contracts_1h_pct=9.0,
+            price_1h_pct=5.0,
+            oi_value_usd=5_000_000,
+            funding_rate_pct=0.01,
+            structure={"score": 84, "base_days": 30, "recent_low_extension_pct": 10},
+            quote_volume_24h_usd=2_310_000,
+            min_quote_volume_24h_usd=5_000_000,
+        )
+        self.assertIsNone(result)
+
+    def test_pullback_without_complete_liquidity_data_cannot_be_open(self) -> None:
+        result = bot.classify_wgl_trade_item(
+            {
+                "symbol": "TESTUSDT",
+                "signal_state": "回踩進場",
+                "score": 80,
+                "quality_score": 80,
+                "risk_score": 5,
+                "liquidity_ready": False,
+            },
+            1,
+            {},
+        )
+        self.assertEqual(result["trade_bucket"], "confirm")
+        self.assertEqual(result["trade_setup"], "流動性待確認")
+
     def test_momentum_quota_survives_structure_ranking(self) -> None:
         candidates = []
         for index in range(20):

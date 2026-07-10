@@ -17,6 +17,7 @@ BINANCE_BASE_URL = "https://fapi.binance.com"
 CRYPTOBUBBLES_URL = "https://cryptobubbles.net/backend/data/bubbles1000.usd.json"
 DEFAULT_TIMEOUT = 12
 BINANCE_BACKOFF_UNTIL = 0.0
+TICKER_24H_CACHE: dict[str, Any] = {"expires_at": 0.0, "rows": {}}
 
 
 class ApiError(RuntimeError):
@@ -87,6 +88,7 @@ class OiSnapshot:
     market_symbol: str | None = None
     source: str = "manual"
     provider_id: str | None = None
+    quote_volume_24h_usd: float | None = None
 
 
 @dataclass
@@ -224,6 +226,19 @@ def get_24h_ticker(symbol: str | None = None) -> Any:
     return _get_json("/fapi/v1/ticker/24hr", params)
 
 
+def get_all_24h_tickers(*, cache_seconds: int = 60) -> dict[str, dict[str, Any]]:
+    now = time.time()
+    cached_rows = TICKER_24H_CACHE.get("rows")
+    if now < float(TICKER_24H_CACHE.get("expires_at") or 0.0) and isinstance(cached_rows, dict):
+        return cached_rows
+    data = get_24h_ticker()
+    if not isinstance(data, list):
+        raise ApiError(f"Unexpected 24h ticker list response: {data}")
+    rows = {str(row.get("symbol", "")).upper(): row for row in data if row.get("symbol")}
+    TICKER_24H_CACHE.update({"expires_at": now + max(10, cache_seconds), "rows": rows})
+    return rows
+
+
 def get_mark_price(symbol: str) -> dict[str, Any]:
     data = _get_json("/fapi/v1/premiumIndex", {"symbol": symbol})
     if not isinstance(data, dict):
@@ -347,6 +362,10 @@ def get_oi_snapshots(
             seen.add(watch.symbol)
 
     mark_prices = get_all_mark_prices()
+    try:
+        tickers_24h = get_all_24h_tickers()
+    except Exception:
+        tickers_24h = {}
     timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     rows: list[OiSnapshot] = []
 
@@ -382,6 +401,7 @@ def get_oi_snapshots(
         open_interest = _to_float(current_oi.get("openInterest")) if isinstance(current_oi, dict) else None
         funding_rate = _to_float(mark.get("lastFundingRate"))
         oi_value = open_interest * mark_price if open_interest is not None and mark_price is not None else None
+        ticker = tickers_24h.get(symbol) or {}
         return OiSnapshot(
             rank=0,
             symbol=symbol,
@@ -396,6 +416,7 @@ def get_oi_snapshots(
             market_symbol=watch.market_symbol,
             source=watch.source,
             provider_id=watch.provider_id,
+            quote_volume_24h_usd=_to_float(ticker.get("quoteVolume")),
         )
 
     futures = {}

@@ -568,6 +568,102 @@ def scan_structure_universe(
     return enriched
 
 
+def assess_liquidity(
+    *,
+    row: Any,
+    wgl: dict[str, Any] | None,
+    book: Any | None,
+    reference_notional_usd: float = 5_000.0,
+    min_quote_volume_24h_usd: float = 5_000_000.0,
+    min_quote_volume_1h_usd: float = 100_000.0,
+    min_depth_multiple: float = 1.5,
+    max_spread_pct: float = 0.20,
+    max_slippage_pct: float = 0.30,
+) -> dict[str, Any]:
+    wgl = wgl or {}
+    reference_notional = max(100.0, float(reference_notional_usd))
+    quote_volume_24h = _number(getattr(row, "quote_volume_24h_usd", None))
+    quote_volume_1h = _number(wgl.get("quote_volume_1h_usd"))
+    spread = _number(getattr(book, "latest_spread_pct", None)) if book else None
+    if spread is None and book:
+        spread = _number(getattr(book, "spread_pct", None))
+    bid_depth = _number(getattr(book, "latest_bid_depth_05pct", None)) if book else None
+    ask_depth = _number(getattr(book, "latest_ask_depth_05pct", None)) if book else None
+    buy_slippage = _number(getattr(book, "buy_slippage_pct", None)) if book else None
+    sell_slippage = _number(getattr(book, "sell_slippage_pct", None)) if book else None
+
+    failures: list[str] = []
+    missing: list[str] = []
+    score = 0.0
+
+    if quote_volume_24h is None:
+        missing.append("24H成交額")
+    else:
+        if quote_volume_24h < min_quote_volume_24h_usd:
+            failures.append("24H成交額低於門檻")
+        if quote_volume_24h >= min_quote_volume_24h_usd * 4:
+            score += 30
+        elif quote_volume_24h >= min_quote_volume_24h_usd * 2:
+            score += 25
+        elif quote_volume_24h >= min_quote_volume_24h_usd:
+            score += 20
+        elif quote_volume_24h >= min_quote_volume_24h_usd * 0.5:
+            score += 8
+
+    if quote_volume_1h is not None:
+        if quote_volume_1h < min_quote_volume_1h_usd:
+            failures.append("最近1H成交額低於門檻")
+        score += 15 if quote_volume_1h >= min_quote_volume_1h_usd * 5 else 10 if quote_volume_1h >= min_quote_volume_1h_usd else 0
+
+    if spread is None:
+        missing.append("spread")
+    else:
+        if spread > max_spread_pct:
+            failures.append("買賣價差過寬")
+        score += 15 if spread <= max_spread_pct / 4 else 12 if spread <= max_spread_pct / 2 else 8 if spread <= max_spread_pct else 0
+
+    min_side_depth = None
+    if bid_depth is None or ask_depth is None:
+        missing.append("0.5%雙邊深度")
+    else:
+        min_side_depth = min(bid_depth, ask_depth)
+        depth_multiple = min_side_depth / reference_notional
+        if depth_multiple < min_depth_multiple:
+            failures.append("0.5%近價深度不足")
+        score += 20 if depth_multiple >= 5 else 16 if depth_multiple >= 3 else 12 if depth_multiple >= 1.5 else 8 if depth_multiple >= min_depth_multiple else 0
+
+    worst_slippage = None
+    if buy_slippage is None or sell_slippage is None:
+        missing.append("雙向滑價")
+    else:
+        worst_slippage = max(buy_slippage, sell_slippage)
+        if worst_slippage > max_slippage_pct:
+            failures.append("固定倉位預估滑價過高")
+        score += 20 if worst_slippage <= max_slippage_pct / 3 else 16 if worst_slippage <= max_slippage_pct / 2 else 10 if worst_slippage <= max_slippage_pct else 0
+
+    blocked = bool(failures)
+    ready = not blocked and not missing
+    status = "不足" if blocked else "合格" if ready else "待資料"
+    return {
+        "liquidity_status": status,
+        "liquidity_score": _clamp(score),
+        "liquidity_ready": ready,
+        "liquidity_blocked": blocked,
+        "liquidity_reasons": failures,
+        "liquidity_missing": missing,
+        "liquidity_reference_notional_usd": reference_notional,
+        "quote_volume_24h_usd": quote_volume_24h,
+        "quote_volume_1h_usd": quote_volume_1h,
+        "liquidity_spread_pct": spread,
+        "liquidity_bid_depth_05pct": bid_depth,
+        "liquidity_ask_depth_05pct": ask_depth,
+        "liquidity_min_side_depth_usd": min_side_depth,
+        "liquidity_buy_slippage_pct": buy_slippage,
+        "liquidity_sell_slippage_pct": sell_slippage,
+        "liquidity_worst_slippage_pct": worst_slippage,
+    }
+
+
 def component_scores(
     *,
     row: Any,
@@ -579,6 +675,12 @@ def component_scores(
     launch: dict[str, Any] | None,
     onchain: Any | None,
     orderbook_min_snapshots: int,
+    liquidity_reference_notional_usd: float = 5_000.0,
+    liquidity_min_quote_volume_24h_usd: float = 5_000_000.0,
+    liquidity_min_quote_volume_1h_usd: float = 100_000.0,
+    liquidity_min_depth_multiple: float = 1.5,
+    liquidity_max_spread_pct: float = 0.20,
+    liquidity_max_slippage_pct: float = 0.30,
 ) -> dict[str, Any]:
     structure = structure or {}
     wgl = wgl or {}
@@ -610,6 +712,17 @@ def component_scores(
         and price_1h > 0
         and oi_1h is not None
         and oi_1h > 0
+    )
+    liquidity = assess_liquidity(
+        row=row,
+        wgl=wgl,
+        book=book,
+        reference_notional_usd=liquidity_reference_notional_usd,
+        min_quote_volume_24h_usd=liquidity_min_quote_volume_24h_usd,
+        min_quote_volume_1h_usd=liquidity_min_quote_volume_1h_usd,
+        min_depth_multiple=liquidity_min_depth_multiple,
+        max_spread_pct=liquidity_max_spread_pct,
+        max_slippage_pct=liquidity_max_slippage_pct,
     )
 
     capital = 0.0
@@ -697,6 +810,8 @@ def component_scores(
         risk += 25
     if basis_pct is not None and basis_pct >= 0.30:
         risk += 20
+    if liquidity["liquidity_blocked"]:
+        risk += 55
     risk_score = _clamp(risk)
 
     overall = _clamp(
@@ -745,4 +860,5 @@ def component_scores(
         "spot_taker_imbalance": spot_taker_imbalance,
         "basis_pct": basis_pct,
         "short_squeeze": short_squeeze,
+        **liquidity,
     }

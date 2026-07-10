@@ -48,6 +48,8 @@ Permanent first-push statistics start at `WGL_STATS_START_DATE` (`2026-07-09` by
 
 On-chain scores count only when the DEX token address matches a verified provider contract. Symbol-only DexScreener matches are shown as reference and contribute zero points. Order-book scoring combines persistent depth with executed taker-buy/taker-sell flow to reduce spoof-wall false positives.
 
+Execution liquidity is a hard trade gate. The default profile models a `5,000 USDT` notional position and requires at least `$5M` 24-hour quote turnover, `$100K` recent 1-hour turnover when available, at least `1.5x` the reference order size on both sides within `0.5%`, spread no wider than `0.20%`, and estimated buy/sell slippage no worse than `0.30%`. A failed gate becomes `不要進`; incomplete depth data can be observed but cannot become `可開單`. Real-time OI spike and ignition alerts also require the 24-hour turnover floor.
+
 Default trade-management assumptions: TP +10% take half, SL -7%, then move stop to entry after half take-profit.
 
 This is research automation, not financial advice.
@@ -70,6 +72,12 @@ STRATEGY_SCAN_INTERVAL_SECONDS=300
 ORDERBOOK_WATCH_CANDIDATES=10
 STRUCTURE_REFRESH_BATCH_SIZE=60
 STRUCTURE_CACHE_SECONDS=21600
+LIQUIDITY_REFERENCE_NOTIONAL_USD=5000
+LIQUIDITY_MIN_QUOTE_VOLUME_24H_USD=5000000
+LIQUIDITY_MIN_QUOTE_VOLUME_1H_USD=100000
+LIQUIDITY_MIN_DEPTH_MULTIPLE=1.5
+LIQUIDITY_MAX_SPREAD_PCT=0.20
+LIQUIDITY_MAX_SLIPPAGE_PCT=0.30
 ```
 
 Important: never commit `.env`. It contains your Telegram token.

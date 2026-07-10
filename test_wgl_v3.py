@@ -6,6 +6,7 @@ import unittest
 
 from wgl_v3 import (
     STRUCTURE_MODEL_VERSION,
+    assess_liquidity,
     component_scores,
     migrate_structure_screen,
     scan_structure_universe,
@@ -214,6 +215,68 @@ class ComponentScoreTests(unittest.TestCase):
         self.assertTrue(result["short_squeeze"])
         self.assertEqual(result["signal_state"], "點火確認")
         self.assertLess(result["risk_score"], 45)
+
+
+class LiquidityGateTests(unittest.TestCase):
+    @staticmethod
+    def executable_book() -> SimpleNamespace:
+        return SimpleNamespace(
+            latest_spread_pct=0.0181,
+            spread_pct=0.02,
+            latest_bid_depth_05pct=28_300.0,
+            latest_ask_depth_05pct=27_900.0,
+            buy_slippage_pct=0.1042,
+            sell_slippage_pct=0.1161,
+        )
+
+    def test_people_style_low_turnover_is_blocked_even_when_depth_looks_usable(self) -> None:
+        result = assess_liquidity(
+            row=SimpleNamespace(quote_volume_24h_usd=2_310_000.0),
+            wgl={"quote_volume_1h_usd": 150_000.0},
+            book=self.executable_book(),
+        )
+        self.assertEqual(result["liquidity_status"], "不足")
+        self.assertTrue(result["liquidity_blocked"])
+        self.assertIn("24H成交額低於門檻", result["liquidity_reasons"])
+
+    def test_healthy_turnover_depth_and_slippage_pass(self) -> None:
+        result = assess_liquidity(
+            row=SimpleNamespace(quote_volume_24h_usd=200_000_000.0),
+            wgl={"quote_volume_1h_usd": 8_000_000.0},
+            book=self.executable_book(),
+        )
+        self.assertEqual(result["liquidity_status"], "合格")
+        self.assertTrue(result["liquidity_ready"])
+        self.assertFalse(result["liquidity_blocked"])
+
+    def test_liquidity_failure_invalidates_an_otherwise_valid_pullback(self) -> None:
+        book = self.executable_book()
+        book.snapshot_count = 20
+        book.score = 65
+        book.verdict = "吸籌觀察"
+        book.avg_imbalance_50 = 0.2
+        result = component_scores(
+            row=SimpleNamespace(funding_rate_pct=0.01, quote_volume_24h_usd=2_310_000.0),
+            metrics={"contracts_1h_pct": 4.0, "price_1h_pct": 3.0},
+            structure={"score": 78, "eligible": True, "data_points": 120},
+            wgl={
+                "strong_pullback": True,
+                "price_1h_pct": 3.0,
+                "oi_1h_pct": 4.0,
+                "price_6h_pct": 6.0,
+                "oi_6h_pct": 7.0,
+                "quote_volume_1h_usd": 150_000.0,
+                "risks": [],
+            },
+            book=book,
+            bottom=None,
+            launch=None,
+            onchain=None,
+            orderbook_min_snapshots=12,
+        )
+        self.assertTrue(result["liquidity_blocked"])
+        self.assertEqual(result["signal_state"], "失效/派發")
+        self.assertGreaterEqual(result["risk_score"], 45)
 
 
 if __name__ == "__main__":

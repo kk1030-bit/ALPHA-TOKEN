@@ -46,6 +46,7 @@ from oi_service import (
 from wgl_v3 import (
     STRUCTURE_MODEL_VERSION,
     TRIGGER_STATES,
+    assess_liquidity,
     component_scores as v3_component_scores,
     live_momentum_score,
     migrate_structure_screen,
@@ -294,6 +295,38 @@ def env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def liquidity_reference_notional_usd() -> float:
+    return env_float("LIQUIDITY_REFERENCE_NOTIONAL_USD", 5_000.0, 100.0)
+
+
+def liquidity_min_quote_volume_24h_usd() -> float:
+    return env_float("LIQUIDITY_MIN_QUOTE_VOLUME_24H_USD", 5_000_000.0, 0.0)
+
+
+def liquidity_min_quote_volume_1h_usd() -> float:
+    return env_float("LIQUIDITY_MIN_QUOTE_VOLUME_1H_USD", 100_000.0, 0.0)
+
+
+def liquidity_min_depth_multiple() -> float:
+    return env_float("LIQUIDITY_MIN_DEPTH_MULTIPLE", 1.5, 0.1)
+
+
+def liquidity_max_spread_pct() -> float:
+    return env_float("LIQUIDITY_MAX_SPREAD_PCT", 0.20, 0.001)
+
+
+def liquidity_max_slippage_pct() -> float:
+    return env_float("LIQUIDITY_MAX_SLIPPAGE_PCT", 0.30, 0.001)
+
+
+def quick_liquidity_pass(row: Any) -> bool:
+    quote_volume = to_float(getattr(row, "quote_volume_24h_usd", None))
+    return bool(
+        quote_volume is not None
+        and quote_volume >= liquidity_min_quote_volume_24h_usd()
+    )
 
 
 def spike_window_seconds() -> int:
@@ -1030,6 +1063,7 @@ def remember_report_sample(history: dict[str, deque[dict[str, Any]]], row: Any, 
             "open_interest": row.open_interest,
             "mark_price": row.mark_price,
             "funding_rate_pct": row.funding_rate_pct,
+            "quote_volume_24h_usd": getattr(row, "quote_volume_24h_usd", None),
             "market_rank": row.market_rank,
             "marketcap_usd": row.marketcap_usd,
         }
@@ -1264,6 +1298,15 @@ def save_wgl_report_event(candidates: list[dict[str, Any]], report_text: str) ->
                 "trigger_score": item.get("trigger_score"),
                 "quality_score": item.get("quality_score"),
                 "risk_score": item.get("risk_score"),
+                "liquidity_status": item.get("liquidity_status"),
+                "liquidity_score": item.get("liquidity_score"),
+                "liquidity_blocked": bool(item.get("liquidity_blocked")),
+                "liquidity_reasons": item.get("liquidity_reasons") or [],
+                "quote_volume_24h_usd": to_float(item.get("quote_volume_24h_usd")),
+                "liquidity_bid_depth_05pct": to_float(item.get("liquidity_bid_depth_05pct")),
+                "liquidity_ask_depth_05pct": to_float(item.get("liquidity_ask_depth_05pct")),
+                "liquidity_buy_slippage_pct": to_float(item.get("liquidity_buy_slippage_pct")),
+                "liquidity_sell_slippage_pct": to_float(item.get("liquidity_sell_slippage_pct")),
                 "labels": item.get("labels"),
                 "reasons": item.get("reasons") or [],
                 "trade_bucket": item.get("trade_bucket"),
@@ -1353,6 +1396,15 @@ def save_wgl_full_scan_event(
                 "trigger_score": component.get("trigger_score"),
                 "quality_score": component.get("quality_score"),
                 "risk_score": component.get("risk_score"),
+                "liquidity_status": component.get("liquidity_status"),
+                "liquidity_score": component.get("liquidity_score"),
+                "liquidity_blocked": bool(component.get("liquidity_blocked")),
+                "liquidity_reasons": component.get("liquidity_reasons") or [],
+                "quote_volume_24h_usd": to_float(getattr(row, "quote_volume_24h_usd", None)),
+                "liquidity_bid_depth_05pct": to_float(component.get("liquidity_bid_depth_05pct")),
+                "liquidity_ask_depth_05pct": to_float(component.get("liquidity_ask_depth_05pct")),
+                "liquidity_buy_slippage_pct": to_float(component.get("liquidity_buy_slippage_pct")),
+                "liquidity_sell_slippage_pct": to_float(component.get("liquidity_sell_slippage_pct")),
                 "short_squeeze": bool(component.get("short_squeeze")),
                 "market_rank_reference": getattr(row, "market_rank", None),
                 "marketcap_reference_usd": to_float(getattr(row, "marketcap_usd", None)),
@@ -1485,6 +1537,10 @@ def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
             "trigger_score": item.get("trigger_score"),
             "quality_score": item.get("quality_score"),
             "risk_score": item.get("risk_score"),
+            "liquidity_status": item.get("liquidity_status"),
+            "liquidity_score": item.get("liquidity_score"),
+            "liquidity_ready": bool(item.get("liquidity_ready")),
+            "liquidity_blocked": bool(item.get("liquidity_blocked")),
             "updated_utc": now_utc,
             "updated_local": now_local,
         }
@@ -1506,7 +1562,7 @@ def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
                 and int(record.get("trigger_score") or 0) >= 35
                 and int(record.get("score") or 0) >= 55
             )
-            if state in TRIGGER_STATES or early_ready:
+            if (state in TRIGGER_STATES or early_ready) and bool(record.get("liquidity_ready")):
                 guidance = (
                     "早期資金共振，先列再確認；等待短線回踩守住，不能直接追價。"
                     if early_ready
@@ -1942,6 +1998,10 @@ def mark_wgl_report_seen(candidates: list[dict[str, Any]], seen: dict[str, dict[
                     "trigger_score": item.get("trigger_score"),
                     "quality_score": item.get("quality_score"),
                     "risk_score": item.get("risk_score"),
+                    "liquidity_status": item.get("liquidity_status"),
+                    "liquidity_score": item.get("liquidity_score"),
+                    "liquidity_blocked": bool(item.get("liquidity_blocked")),
+                    "quote_volume_24h_usd": to_float(item.get("quote_volume_24h_usd")),
                     "wgl_score": item.get("wgl_score"),
                     "trade_bucket": item.get("trade_bucket"),
                     "trade_decision": item.get("trade_decision"),
@@ -1998,7 +2058,14 @@ def classify_oi_trend_signal(
     oi_value_usd: float | None,
     funding_rate_pct: float | None,
     structure: dict[str, Any] | None,
+    quote_volume_24h_usd: float | None = None,
+    min_quote_volume_24h_usd: float | None = None,
 ) -> dict[str, str] | None:
+    if min_quote_volume_24h_usd is not None and (
+        quote_volume_24h_usd is None
+        or quote_volume_24h_usd < min_quote_volume_24h_usd
+    ):
+        return None
     if (
         contracts_1h_pct is None
         or price_1h_pct is None
@@ -3004,6 +3071,7 @@ def collect_strategy_alerts(
             setup_reason = f"{setup_reason} | 鏈上地址未驗證，不計分"
         if orderbook_enabled():
             try:
+                seed_orderbook_symbol(symbol)
                 orderbook_signal = analyze_orderbook_accumulation(
                     symbol,
                     orderbook_db_path(),
@@ -3013,7 +3081,31 @@ def collect_strategy_alerts(
             except Exception as exc:
                 print(f"Strategy orderbook filter error for {symbol}: {exc}", file=sys.stderr, flush=True)
                 orderbook_signal = None
-            if orderbook_signal is not None and orderbook_signal.snapshot_count >= orderbook_min_snapshots():
+            if orderbook_signal is None:
+                continue
+            liquidity_row = type(
+                "StrategyLiquidityRow",
+                (),
+                {"quote_volume_24h_usd": sample.get("quote_volume_24h_usd")},
+            )()
+            liquidity = assess_liquidity(
+                row=liquidity_row,
+                wgl={},
+                book=orderbook_signal,
+                reference_notional_usd=liquidity_reference_notional_usd(),
+                min_quote_volume_24h_usd=liquidity_min_quote_volume_24h_usd(),
+                min_quote_volume_1h_usd=liquidity_min_quote_volume_1h_usd(),
+                min_depth_multiple=liquidity_min_depth_multiple(),
+                max_spread_pct=liquidity_max_spread_pct(),
+                max_slippage_pct=liquidity_max_slippage_pct(),
+            )
+            if not liquidity["liquidity_ready"]:
+                continue
+            setup_reason = (
+                f"{setup_reason} | 流動性{liquidity['liquidity_score']}分 "
+                f"24H ${fmt_num(liquidity['quote_volume_24h_usd'])}"
+            )
+            if orderbook_signal.snapshot_count >= orderbook_min_snapshots():
                 if orderbook_signal.verdict == "偏弱/派發" and orderbook_signal.score <= 20:
                     continue
                 if orderbook_signal.score >= orderbook_min_score():
@@ -3021,6 +3113,8 @@ def collect_strategy_alerts(
                     setup_reason = f"{setup_reason} | 訂單簿{orderbook_signal.verdict} {orderbook_signal.score}分"
                 else:
                     setup_reason = f"{setup_reason} | 訂單簿{orderbook_signal.verdict} {orderbook_signal.score}分"
+        else:
+            continue
         candidates.append((setup_score, symbol, result, sample, mark_price, setup_reason))
 
     for _, symbol, result, sample, mark_price, setup_reason in sorted(
@@ -3474,6 +3568,8 @@ def wgl_recent_context(symbol: str) -> dict[str, Any]:
         "oi_6h_pct": None,
         "oi_24h_pct": None,
         "volume_ratio_3h": None,
+        "quote_volume_1h_usd": None,
+        "quote_volume_3h_usd": None,
         "range_6h_low": None,
         "range_6h_high": None,
         "range_6h_position_pct": None,
@@ -3510,6 +3606,9 @@ def wgl_recent_context(symbol: str) -> dict[str, Any]:
             context["drawdown_from_24h_high_pct"] = (range_24h_high - last_close) / range_24h_high * 100.0
         recent_volume = avg_clean(quote_volumes[-3:])
         base_volume = list_median([value for value in quote_volumes[-24:-3] if value is not None])
+        context["quote_volume_1h_usd"] = quote_volumes[-1] if quote_volumes else None
+        recent_quote_volumes = [value for value in quote_volumes[-3:] if value is not None]
+        context["quote_volume_3h_usd"] = sum(recent_quote_volumes) if recent_quote_volumes else None
         if recent_volume is not None and base_volume is not None and base_volume > 0:
             context["volume_ratio_3h"] = recent_volume / base_volume
     except Exception as exc:
@@ -3946,6 +4045,8 @@ def wgl_stage_candidate(
         "price_24h_pct": price_24h,
         "oi_24h_pct": oi_24h,
         "volume_ratio": volume_ratio,
+        "quote_volume_1h_usd": to_float(context.get("quote_volume_1h_usd")),
+        "quote_volume_3h_usd": to_float(context.get("quote_volume_3h_usd")),
         "range_6h_position_pct": range_6h_position,
         "range_24h_position_pct": range_24h_position,
         "drawdown_from_24h_high_pct": drawdown_from_24h_high,
@@ -4125,6 +4226,12 @@ def composite_candidate_rows(
             launch=launch,
             onchain=onchain_signal,
             orderbook_min_snapshots=orderbook_min_snapshots(),
+            liquidity_reference_notional_usd=liquidity_reference_notional_usd(),
+            liquidity_min_quote_volume_24h_usd=liquidity_min_quote_volume_24h_usd(),
+            liquidity_min_quote_volume_1h_usd=liquidity_min_quote_volume_1h_usd(),
+            liquidity_min_depth_multiple=liquidity_min_depth_multiple(),
+            liquidity_max_spread_pct=liquidity_max_spread_pct(),
+            liquidity_max_slippage_pct=liquidity_max_slippage_pct(),
         )
 
         labels = [components["signal_state"]]
@@ -4169,6 +4276,13 @@ def composite_candidate_rows(
             reasons.append(f"現貨主動成交 {fmt_pct(float(components['spot_taker_imbalance']) * 100)}")
         if components.get("basis_pct") is not None:
             reasons.append(f"合約基差 {fmt_pct(components.get('basis_pct'), 4)}")
+        liquidity_status = str(components.get("liquidity_status") or "待資料")
+        if liquidity_status == "不足":
+            detail = "、".join(str(value) for value in components.get("liquidity_reasons") or [])
+            risks.append(f"流動性不足：{detail or '未通過成交門檻'}")
+        elif liquidity_status == "待資料":
+            missing = "、".join(str(value) for value in components.get("liquidity_missing") or [])
+            risks.append(f"流動性待確認：{missing or '資料不足'}")
 
         funding = to_float(getattr(row, "funding_rate_pct", None))
         if funding is not None and abs(funding) > strategy_max_funding_pct():
@@ -4250,12 +4364,29 @@ def classify_wgl_trade_item(
     risk = int(item.get("risk_score") or 0)
     notice_label = "再次出現" if first_seen else "首次通知"
 
+    if item.get("liquidity_blocked"):
+        liquidity_reason = "、".join(str(value) for value in item.get("liquidity_reasons") or [])
+        return {
+            "trade_bucket": "blocked",
+            "trade_decision": "不要進",
+            "trade_setup": "流動性不足",
+            "trade_reason": liquidity_reason or "成交額、深度或滑價未達門檻",
+            "first_seen": first_seen or None,
+        }
     if state == "失效/派發" or risk >= 45:
         return {
             "trade_bucket": "blocked",
             "trade_decision": "不要進",
             "trade_setup": "失效/派發",
             "trade_reason": f"風險 {risk}/100，等待重新形成底部",
+            "first_seen": first_seen or None,
+        }
+    if state == "回踩進場" and not item.get("liquidity_ready"):
+        return {
+            "trade_bucket": "confirm",
+            "trade_decision": "待確認",
+            "trade_setup": "流動性待確認",
+            "trade_reason": "結構已通過，但成交深度與滑價資料尚未完整",
             "first_seen": first_seen or None,
         }
     if state == "回踩進場" and quality >= 50 and score >= 50:
@@ -4422,6 +4553,29 @@ def wgl_entry_condition(item: dict[str, Any]) -> str:
     return "目前不進場"
 
 
+def format_wgl_liquidity(item: dict[str, Any]) -> str:
+    status = str(item.get("liquidity_status") or "待資料")
+    score = int(to_float(item.get("liquidity_score")) or 0)
+    volume_24h = to_float(item.get("quote_volume_24h_usd"))
+    bid_depth = to_float(item.get("liquidity_bid_depth_05pct"))
+    ask_depth = to_float(item.get("liquidity_ask_depth_05pct"))
+    reference = to_float(item.get("liquidity_reference_notional_usd"))
+    buy_slippage = to_float(item.get("liquidity_buy_slippage_pct"))
+    sell_slippage = to_float(item.get("liquidity_sell_slippage_pct"))
+
+    def money(value: float | None) -> str:
+        return "n/a" if value is None else f"${fmt_num(value)}"
+
+    def percent(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.2f}%"
+
+    return (
+        f"流動性：{status} {score}/100｜24H {money(volume_24h)}｜"
+        f"0.5%深度 B/A {money(bid_depth)}/{money(ask_depth)}｜"
+        f"{money(reference)}滑價 買/賣 {percent(buy_slippage)}/{percent(sell_slippage)}"
+    )
+
+
 def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> str:
     row = item["row"]
     metrics = item.get("metrics") or {}
@@ -4450,10 +4604,11 @@ def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, di
                 f"觸發：{item.get('trigger_score', 0)}｜資料：{item.get('quality_score', 0)}｜"
                 f"風險分：{item.get('risk_score', 0)}"
             ),
+            format_wgl_liquidity(item),
             f"出現次數：第 {state['push_count']} 次",
             f"理由：{wgl_card_reasons(item)}",
             f"進場條件：{wgl_entry_condition(item)}",
-            "失效條件：Funding過熱／OI增價跌／訂單簿派發／跌破底部結構",
+            "失效條件：流動性不足／Funding過熱／OI增價跌／訂單簿派發／跌破底部結構",
             f"#：{index}",
             f"首次推送：{state['first_time']}",
             f"首訊方向：{state['direction']}",
@@ -4688,7 +4843,8 @@ def collect_orderbook_cycle(history: dict[str, deque[dict[str, Any]]] | None = N
             symbols,
             orderbook_db_path(),
             max_workers=orderbook_workers(),
-            limit=50,
+            limit=100,
+            reference_notional_usd=liquidity_reference_notional_usd(),
         )
         try:
             prune_orderbook_db(orderbook_db_path(), keep_days=orderbook_prune_days())
@@ -4708,7 +4864,8 @@ def seed_orderbook_symbol(symbol: str) -> None:
             [symbol],
             orderbook_db_path(),
             max_workers=1,
-            limit=50,
+            limit=100,
+            reference_notional_usd=liquidity_reference_notional_usd(),
         )
     except Exception as exc:
         print(f"Orderbook seed error for {symbol}: {exc}", file=sys.stderr, flush=True)
@@ -4726,7 +4883,8 @@ def legacy_build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]]
                     [item["row"].symbol for item in ranked[:orderbook_report_seed_candidates()]],
                     orderbook_db_path(),
                     max_workers=orderbook_workers(),
-                    limit=50,
+                    limit=100,
+                    reference_notional_usd=liquidity_reference_notional_usd(),
                 )
         except Exception as exc:
             print(f"Hourly orderbook seed error: {exc}", file=sys.stderr, flush=True)
@@ -4879,7 +5037,8 @@ def build_onchain_hourly_report(
                     [item["row"].symbol for item in ranked[:orderbook_report_seed_candidates()]],
                     orderbook_db_path(),
                     max_workers=orderbook_workers(),
-                    limit=50,
+                    limit=100,
+                    reference_notional_usd=liquidity_reference_notional_usd(),
                 )
         except Exception as exc:
             print(f"Hourly orderbook seed error: {exc}", file=sys.stderr, flush=True)
@@ -5302,6 +5461,7 @@ def collect_spike_alerts(
             "open_interest": row.open_interest,
             "mark_price": row.mark_price,
             "funding_rate_pct": row.funding_rate_pct,
+            "quote_volume_24h_usd": row.quote_volume_24h_usd,
             "market_rank": row.market_rank,
             "marketcap_usd": row.marketcap_usd,
         }
@@ -5341,6 +5501,7 @@ def collect_spike_alerts(
                 and change_usd >= min_usd
                 and contracts_pct is not None
                 and contracts_pct >= min_contracts_pct
+                and quick_liquidity_pass(row)
                 and now - last_alert_at.get(spike_key, last_alert_at.get(row.symbol, 0.0)) >= cooldown
             )
             if spike_ready:
@@ -5371,6 +5532,7 @@ def collect_spike_alerts(
                     "new_open_interest": new_contracts,
                     "mark_price": row.mark_price,
                     "funding_rate_pct": row.funding_rate_pct,
+                    "quote_volume_24h_usd": row.quote_volume_24h_usd,
                     "market_rank": row.market_rank,
                     "marketcap_usd": row.marketcap_usd,
                     "watch_source": watch_source_description(),
@@ -5384,6 +5546,7 @@ def collect_spike_alerts(
                     f"合約OI：{fmt_num(old_contracts)} -> {fmt_num(new_contracts)} ({fmt_pct(contracts_pct)})\n"
                     f"價格變化：{fmt_pct(price_pct)}\n"
                     f"標記價格：{fmt_num(row.mark_price, 5)} | Funding：{fmt_pct(row.funding_rate_pct, 4)}\n"
+                    f"24H成交額：${fmt_num(row.quote_volume_24h_usd)}\n"
                     f"門檻：OI價值 +{min_pct:.2f}% / +${fmt_num(min_usd)}，合約OI +{min_contracts_pct:.2f}%"
                 )
                 short_triggered = True
@@ -5409,6 +5572,8 @@ def collect_spike_alerts(
             oi_value_usd=to_float(sample.get("oi_value_usd")),
             funding_rate_pct=to_float(sample.get("funding_rate_pct")),
             structure=structure,
+            quote_volume_24h_usd=to_float(sample.get("quote_volume_24h_usd")),
+            min_quote_volume_24h_usd=liquidity_min_quote_volume_24h_usd(),
         )
         trend_key = f"trend:{row.symbol}"
         if trend_signal is None or now - last_alert_at.get(trend_key, 0.0) < trend_cooldown_seconds():
@@ -5428,6 +5593,7 @@ def collect_spike_alerts(
             "mark_price": row.mark_price,
             "oi_value_usd": row.oi_value_usd,
             "funding_rate_pct": row.funding_rate_pct,
+            "quote_volume_24h_usd": row.quote_volume_24h_usd,
             "structure_score": structure_score,
             "structure_eligible": bool(structure.get("eligible")),
             "action": trend_signal["action"],
@@ -5438,6 +5604,7 @@ def collect_spike_alerts(
             f"類型：{trend_signal['signal_type']}\n"
             f"價格 1H：{fmt_pct(trend_price_pct)}｜合約 OI 1H：{fmt_pct(trend_contracts_pct)}\n"
             f"結構：{structure_score}/100｜Funding：{fmt_pct(row.funding_rate_pct, 4)}｜OI ${fmt_num(row.oi_value_usd)}\n"
+            f"24H成交額：${fmt_num(row.quote_volume_24h_usd)}｜"
             f"判定：{trend_signal['action']}"
         )
 
@@ -5669,6 +5836,11 @@ def format_system_status(chat_id: int) -> str:
             f"目前前五：{top_text}",
             f"OI 雷達：每 {spike_check_seconds()} 秒輪巡｜{coverage_text}｜含 1H 資金點火",
             f"委託簿：{orderbook_watch_candidates()} 檔／{orderbook_collect_interval_seconds()} 秒",
+            (
+                f"流動性：{fmt_num(liquidity_reference_notional_usd())}U 倉位｜"
+                f"24H成交額 >= ${fmt_num(liquidity_min_quote_volume_24h_usd())}｜"
+                f"最大滑價 {liquidity_max_slippage_pct():.2f}%"
+            ),
             f"V3 策略：每 {strategy_scan_interval_seconds() // 60} 分鐘｜手動盯盤 {manual_positions}｜模擬單 {strategy_positions}",
         ]
     )
@@ -5728,6 +5900,7 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
             f"同幣冷卻時間：{spike_cooldown_seconds()} 秒\n"
             f"1H 底部點火：OI +{trend_min_contracts_pct():.2f}%、價格 +{trend_min_price_pct():.2f}% 至 +{trend_max_bottom_price_pct():.2f}%\n"
             f"1H 強勢延續：OI +{momentum_min_contracts_pct():.2f}%、價格 +{momentum_min_price_pct():.2f}%\n"
+            f"流動性快篩：24H成交額 >= ${fmt_num(liquidity_min_quote_volume_24h_usd())}\n"
             f"1H 通知冷卻：{trend_cooldown_seconds()} 秒"
         )
 

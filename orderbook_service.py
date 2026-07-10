@@ -62,6 +62,13 @@ class DepthSnapshot:
     taker_buy_notional: float | None
     taker_sell_notional: float | None
     trade_imbalance: float | None
+    reference_notional_usd: float | None = None
+    bid_depth_05pct: float | None = None
+    ask_depth_05pct: float | None = None
+    bid_depth_1pct: float | None = None
+    ask_depth_1pct: float | None = None
+    buy_slippage_pct: float | None = None
+    sell_slippage_pct: float | None = None
 
 
 @dataclass
@@ -83,6 +90,14 @@ class OrderbookSignal:
     spread_pct: float | None = None
     avg_trade_imbalance: float | None = None
     latest_trade_imbalance: float | None = None
+    latest_spread_pct: float | None = None
+    reference_notional_usd: float | None = None
+    latest_bid_depth_05pct: float | None = None
+    latest_ask_depth_05pct: float | None = None
+    latest_bid_depth_1pct: float | None = None
+    latest_ask_depth_1pct: float | None = None
+    buy_slippage_pct: float | None = None
+    sell_slippage_pct: float | None = None
     reasons: list[str] | None = None
 
 
@@ -133,6 +148,59 @@ def _sum_notional(levels: list[list[str]], limit: int) -> float | None:
     return total if used else None
 
 
+def _band_notional(
+    levels: list[list[str]],
+    mid_price: float | None,
+    band_pct: float,
+    *,
+    is_bid: bool,
+) -> float | None:
+    if mid_price is None or mid_price <= 0:
+        return None
+    boundary = mid_price * (1.0 - band_pct / 100.0 if is_bid else 1.0 + band_pct / 100.0)
+    total = 0.0
+    used = 0
+    for price_raw, qty_raw, *_ in levels:
+        price = _to_float(price_raw)
+        qty = _to_float(qty_raw)
+        if price is None or qty is None:
+            continue
+        inside = price >= boundary if is_bid else price <= boundary
+        if not inside:
+            break
+        total += price * qty
+        used += 1
+    return total if used else 0.0
+
+
+def _market_slippage_pct(
+    levels: list[list[str]],
+    mid_price: float | None,
+    target_notional_usd: float,
+) -> float | None:
+    if mid_price is None or mid_price <= 0 or target_notional_usd <= 0:
+        return None
+    remaining = target_notional_usd
+    executed_notional = 0.0
+    executed_quantity = 0.0
+    for price_raw, qty_raw, *_ in levels:
+        price = _to_float(price_raw)
+        quantity = _to_float(qty_raw)
+        if price is None or quantity is None or price <= 0 or quantity <= 0:
+            continue
+        available_notional = price * quantity
+        take_notional = min(remaining, available_notional)
+        executed_notional += take_notional
+        executed_quantity += take_notional / price
+        remaining -= take_notional
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-6 or executed_quantity <= 0:
+        return None
+    vwap = executed_notional / executed_quantity
+    return abs(vwap / mid_price - 1.0) * 100.0
+
+
 def _imbalance(bid_notional: float | None, ask_notional: float | None) -> float | None:
     if bid_notional is None or ask_notional is None:
         return None
@@ -148,7 +216,12 @@ def _ratio(bid_notional: float | None, ask_notional: float | None) -> float | No
     return bid_notional / ask_notional
 
 
-def fetch_depth_snapshot(symbol: str, *, limit: int = 50) -> DepthSnapshot:
+def fetch_depth_snapshot(
+    symbol: str,
+    *,
+    limit: int = 100,
+    reference_notional_usd: float = 5_000.0,
+) -> DepthSnapshot:
     symbol = symbol.strip().upper()
     payload = _get_json("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
     bids = payload.get("bids") or []
@@ -165,6 +238,12 @@ def fetch_depth_snapshot(symbol: str, *, limit: int = 50) -> DepthSnapshot:
     ask_20 = _sum_notional(asks, 20)
     bid_50 = _sum_notional(bids, 50)
     ask_50 = _sum_notional(asks, 50)
+    bid_depth_05pct = _band_notional(bids, mid_price, 0.5, is_bid=True)
+    ask_depth_05pct = _band_notional(asks, mid_price, 0.5, is_bid=False)
+    bid_depth_1pct = _band_notional(bids, mid_price, 1.0, is_bid=True)
+    ask_depth_1pct = _band_notional(asks, mid_price, 1.0, is_bid=False)
+    buy_slippage_pct = _market_slippage_pct(asks, mid_price, reference_notional_usd)
+    sell_slippage_pct = _market_slippage_pct(bids, mid_price, reference_notional_usd)
     trades = _get_json("/fapi/v1/aggTrades", {"symbol": symbol, "limit": 500})
     taker_buy = 0.0
     taker_sell = 0.0
@@ -195,6 +274,13 @@ def fetch_depth_snapshot(symbol: str, *, limit: int = 50) -> DepthSnapshot:
         taker_buy_notional=taker_buy if trade_total > 0 else None,
         taker_sell_notional=taker_sell if trade_total > 0 else None,
         trade_imbalance=trade_imbalance,
+        reference_notional_usd=reference_notional_usd,
+        bid_depth_05pct=bid_depth_05pct,
+        ask_depth_05pct=ask_depth_05pct,
+        bid_depth_1pct=bid_depth_1pct,
+        ask_depth_1pct=ask_depth_1pct,
+        buy_slippage_pct=buy_slippage_pct,
+        sell_slippage_pct=sell_slippage_pct,
     )
 
 
@@ -219,6 +305,13 @@ def init_orderbook_db(db_path: Path) -> None:
                 taker_buy_notional REAL,
                 taker_sell_notional REAL,
                 trade_imbalance REAL,
+                reference_notional_usd REAL,
+                bid_depth_05pct REAL,
+                ask_depth_05pct REAL,
+                bid_depth_1pct REAL,
+                ask_depth_1pct REAL,
+                buy_slippage_pct REAL,
+                sell_slippage_pct REAL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(symbol, ts)
             )
@@ -228,7 +321,18 @@ def init_orderbook_db(db_path: Path) -> None:
             "CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_ts ON orderbook_snapshots(symbol, ts)"
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(orderbook_snapshots)")}
-        for name in ("taker_buy_notional", "taker_sell_notional", "trade_imbalance"):
+        for name in (
+            "taker_buy_notional",
+            "taker_sell_notional",
+            "trade_imbalance",
+            "reference_notional_usd",
+            "bid_depth_05pct",
+            "ask_depth_05pct",
+            "bid_depth_1pct",
+            "ask_depth_1pct",
+            "buy_slippage_pct",
+            "sell_slippage_pct",
+        ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE orderbook_snapshots ADD COLUMN {name} REAL")
 
@@ -243,8 +347,12 @@ def save_depth_snapshot(db_path: Path, snapshot: DepthSnapshot) -> None:
                 bid_notional_20, ask_notional_20,
                 bid_notional_50, ask_notional_50,
                 imbalance_20, imbalance_50, bid_ask_ratio_50,
-                taker_buy_notional, taker_sell_notional, trade_imbalance
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                taker_buy_notional, taker_sell_notional, trade_imbalance,
+                reference_notional_usd,
+                bid_depth_05pct, ask_depth_05pct,
+                bid_depth_1pct, ask_depth_1pct,
+                buy_slippage_pct, sell_slippage_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.symbol,
@@ -261,6 +369,13 @@ def save_depth_snapshot(db_path: Path, snapshot: DepthSnapshot) -> None:
                 snapshot.taker_buy_notional,
                 snapshot.taker_sell_notional,
                 snapshot.trade_imbalance,
+                snapshot.reference_notional_usd,
+                snapshot.bid_depth_05pct,
+                snapshot.ask_depth_05pct,
+                snapshot.bid_depth_1pct,
+                snapshot.ask_depth_1pct,
+                snapshot.buy_slippage_pct,
+                snapshot.sell_slippage_pct,
             ),
         )
 
@@ -277,7 +392,8 @@ def collect_orderbook_snapshots(
     db_path: Path,
     *,
     max_workers: int = 12,
-    limit: int = 50,
+    limit: int = 100,
+    reference_notional_usd: float = 5_000.0,
 ) -> tuple[list[DepthSnapshot], dict[str, str]]:
     init_orderbook_db(db_path)
     clean_symbols = []
@@ -293,7 +409,12 @@ def collect_orderbook_snapshots(
     errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         future_map = {
-            executor.submit(fetch_depth_snapshot, symbol, limit=limit): symbol
+            executor.submit(
+                fetch_depth_snapshot,
+                symbol,
+                limit=limit,
+                reference_notional_usd=reference_notional_usd,
+            ): symbol
             for symbol in clean_symbols
         }
         for future in as_completed(future_map):
@@ -318,7 +439,11 @@ def _rows_for_symbol(db_path: Path, symbol: str, lookback_seconds: int) -> list[
             SELECT symbol, ts, mid_price, spread_pct,
                    bid_notional_50, ask_notional_50,
                    imbalance_50, bid_ask_ratio_50,
-                   taker_buy_notional, taker_sell_notional, trade_imbalance
+                   taker_buy_notional, taker_sell_notional, trade_imbalance,
+                   reference_notional_usd,
+                   bid_depth_05pct, ask_depth_05pct,
+                   bid_depth_1pct, ask_depth_1pct,
+                   buy_slippage_pct, sell_slippage_pct
             FROM orderbook_snapshots
             WHERE symbol = ? AND ts >= ?
             ORDER BY ts ASC
@@ -363,6 +488,16 @@ def _fmt_ratio(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def _fmt_usd(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if abs(value) >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    if abs(value) >= 1_000:
+        return f"${value / 1_000:.1f}K"
+    return f"${value:.0f}"
+
+
 def analyze_orderbook_accumulation(
     symbol: str,
     db_path: Path,
@@ -372,6 +507,15 @@ def analyze_orderbook_accumulation(
 ) -> OrderbookSignal:
     symbol = symbol.strip().upper()
     rows = _rows_for_symbol(db_path, symbol, lookback_seconds)
+    latest = rows[-1] if rows else {}
+    latest_spread = _to_float(latest.get("spread_pct"))
+    reference_notional = _to_float(latest.get("reference_notional_usd"))
+    latest_bid_depth_05pct = _to_float(latest.get("bid_depth_05pct"))
+    latest_ask_depth_05pct = _to_float(latest.get("ask_depth_05pct"))
+    latest_bid_depth_1pct = _to_float(latest.get("bid_depth_1pct"))
+    latest_ask_depth_1pct = _to_float(latest.get("ask_depth_1pct"))
+    buy_slippage_pct = _to_float(latest.get("buy_slippage_pct"))
+    sell_slippage_pct = _to_float(latest.get("sell_slippage_pct"))
     if len(rows) < min_snapshots:
         return OrderbookSignal(
             symbol=symbol,
@@ -380,6 +524,14 @@ def analyze_orderbook_accumulation(
             snapshot_count=len(rows),
             lookback_seconds=lookback_seconds,
             latest_ts=float(rows[-1]["ts"]) if rows else None,
+            latest_spread_pct=latest_spread,
+            reference_notional_usd=reference_notional,
+            latest_bid_depth_05pct=latest_bid_depth_05pct,
+            latest_ask_depth_05pct=latest_ask_depth_05pct,
+            latest_bid_depth_1pct=latest_bid_depth_1pct,
+            latest_ask_depth_1pct=latest_ask_depth_1pct,
+            buy_slippage_pct=buy_slippage_pct,
+            sell_slippage_pct=sell_slippage_pct,
             reasons=[f"order book 快照不足：{len(rows)}/{min_snapshots}"],
         )
 
@@ -402,7 +554,6 @@ def analyze_orderbook_accumulation(
     last_ask = _median(ask_depths[-window:])
     first_ratio = _median(ratios[:window])
     last_ratio = _median(ratios[-window:])
-    latest = rows[-1]
     latest_imbalance = _to_float(latest.get("imbalance_50"))
     latest_trade_imbalance = _to_float(latest.get("trade_imbalance"))
     avg_imbalance = _avg(imbalances)
@@ -525,6 +676,14 @@ def analyze_orderbook_accumulation(
         spread_pct=spread,
         avg_trade_imbalance=avg_trade_imbalance,
         latest_trade_imbalance=latest_trade_imbalance,
+        latest_spread_pct=latest_spread,
+        reference_notional_usd=reference_notional,
+        latest_bid_depth_05pct=latest_bid_depth_05pct,
+        latest_ask_depth_05pct=latest_ask_depth_05pct,
+        latest_bid_depth_1pct=latest_bid_depth_1pct,
+        latest_ask_depth_1pct=latest_ask_depth_1pct,
+        buy_slippage_pct=buy_slippage_pct,
+        sell_slippage_pct=sell_slippage_pct,
         reasons=reasons,
     )
 
@@ -546,6 +705,12 @@ def format_orderbook_signal(signal: OrderbookSignal) -> str:
         (
             f"實際成交方向：最新 {_fmt_pct((signal.latest_trade_imbalance or 0) * 100) if signal.latest_trade_imbalance is not None else 'n/a'}"
             f"｜均值 {_fmt_pct((signal.avg_trade_imbalance or 0) * 100) if signal.avg_trade_imbalance is not None else 'n/a'}"
+        ),
+        (
+            f"流動性：spread {_fmt_pct(signal.latest_spread_pct)}｜0.5%深度 B/A "
+            f"{_fmt_usd(signal.latest_bid_depth_05pct)}/{_fmt_usd(signal.latest_ask_depth_05pct)}｜"
+            f"{_fmt_usd(signal.reference_notional_usd)}滑價 買/賣 "
+            f"{_fmt_pct(signal.buy_slippage_pct)}/{_fmt_pct(signal.sell_slippage_pct)}"
         ),
     ]
     if reasons:
