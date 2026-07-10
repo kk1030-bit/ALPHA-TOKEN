@@ -17,6 +17,7 @@ from typing import Any
 
 import openpyxl
 
+from notification_cards import notification_caption, render_notification_card
 from phase_signal_demo import classify_phase
 from onchain_service import analyze_onchain, format_onchain_report
 from orderbook_service import (
@@ -114,6 +115,57 @@ def telegram_call(token: str, method: str, params: dict[str, Any] | None = None,
         raise RuntimeError(f"Telegram HTTP {exc.code}: {body}") from exc
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram API error: {payload}")
+    return payload.get("result")
+
+
+def telegram_send_photo(
+    token: str,
+    chat_id: int,
+    image_bytes: bytes,
+    *,
+    caption: str = "",
+    timeout: int = 60,
+) -> Any:
+    boundary = f"----alpha-token-{int(time.time() * 1000)}"
+    chunks: list[bytes] = []
+
+    def add_field(name: str, value: object) -> None:
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("ascii"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    add_field("chat_id", chat_id)
+    if caption:
+        add_field("caption", caption[:1024])
+    chunks.extend(
+        [
+            f"--{boundary}\r\n".encode("ascii"),
+            b'Content-Disposition: form-data; name="photo"; filename="alpha-token.png"\r\n',
+            b"Content-Type: image/png\r\n\r\n",
+            image_bytes,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("ascii"),
+        ]
+    )
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=b"".join(chunks),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram sendPhoto HTTP {exc.code}: {body}") from exc
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram sendPhoto error: {payload}")
     return payload.get("result")
 
 
@@ -295,6 +347,10 @@ def env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def notification_cards_enabled() -> bool:
+    return env_bool("TELEGRAM_CARD_MODE", True)
 
 
 def liquidity_reference_notional_usd() -> float:
@@ -5632,6 +5688,23 @@ def send_long_message(token: str, chat_id: int, text: str) -> None:
         time.sleep(0.25)
 
 
+def send_card_message(token: str, chat_id: int, text: str) -> None:
+    if not notification_cards_enabled():
+        send_long_message(token, chat_id, text)
+        return
+    try:
+        image_bytes = render_notification_card(text)
+        telegram_send_photo(
+            token,
+            chat_id,
+            image_bytes,
+            caption=notification_caption(text),
+        )
+    except Exception as exc:
+        print(f"Card send fallback for {chat_id}: {exc}", file=sys.stderr, flush=True)
+        send_long_message(token, chat_id, text)
+
+
 def split_command(text: str) -> tuple[str, list[str]]:
     parts = text.strip().split()
     if not parts:
@@ -6146,7 +6219,11 @@ def run_bot() -> None:
                     reply = f"Data error: {exc}"
                 except Exception as exc:
                     reply = f"Bot error: {exc}"
-                send_long_message(token, int(chat_id), reply)
+                command, _ = split_command(text)
+                if command in {"/report", "/strategy_report", "/positions"}:
+                    send_card_message(token, int(chat_id), reply)
+                else:
+                    send_long_message(token, int(chat_id), reply)
 
             if orderbook_future is not None and orderbook_future.done():
                 try:
@@ -6174,13 +6251,13 @@ def run_bot() -> None:
                 if report:
                     for chat_id in subscribers:
                         try:
-                            send_long_message(token, int(chat_id), report)
+                            send_card_message(token, int(chat_id), report)
                         except Exception as exc:
                             print(f"Report send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 for alert in consume_wgl_transition_alerts():
                     for chat_id in subscribers:
                         try:
-                            send_long_message(token, int(chat_id), alert)
+                            send_card_message(token, int(chat_id), alert)
                         except Exception as exc:
                             print(f"Transition send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 report_future = None
@@ -6198,7 +6275,7 @@ def run_bot() -> None:
                     report = build_strategy_report(spike_history)
                     for chat_id in subscribers:
                         try:
-                            send_long_message(token, int(chat_id), report)
+                            send_card_message(token, int(chat_id), report)
                         except Exception as exc:
                             print(f"Strategy report send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 next_strategy_report_at = time.time() + strategy_report_interval_seconds()
@@ -6213,7 +6290,7 @@ def run_bot() -> None:
                 subscribers = load_subscribers()
                 for chat_id in subscribers:
                     try:
-                        send_long_message(token, int(chat_id), summary)
+                        send_card_message(token, int(chat_id), summary)
                     except Exception as exc:
                         print(f"WGL daily summary send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 daily_summary_state["last_sent_date"] = summary_day
@@ -6229,7 +6306,7 @@ def run_bot() -> None:
                     print(f"Position monitor error: {exc}", file=sys.stderr, flush=True)
                 for chat_id, alert in position_alerts:
                     try:
-                        send_long_message(token, int(chat_id), alert)
+                        send_card_message(token, int(chat_id), alert)
                     except Exception as exc:
                         print(f"Position send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 next_position_check_at = time.time() + position_check_seconds()
@@ -6244,7 +6321,7 @@ def run_bot() -> None:
                 for alert in strategy_alerts:
                     for chat_id in subscribers:
                         try:
-                            send_long_message(token, int(chat_id), alert)
+                            send_card_message(token, int(chat_id), alert)
                         except Exception as exc:
                             print(f"Strategy send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 strategy_future = None
@@ -6260,7 +6337,7 @@ def run_bot() -> None:
                     for alert in alerts:
                         for chat_id in subscribers:
                             try:
-                                send_long_message(token, int(chat_id), alert)
+                                send_card_message(token, int(chat_id), alert)
                             except Exception as exc:
                                 print(f"Spike send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                     if strategy_future is None and time.time() >= next_strategy_scan_at:

@@ -22,6 +22,8 @@ Deferred design work is recorded in [NIGHT_MODE_PLAN.md](NIGHT_MODE_PLAN.md). Th
 
 The Telegram menu exposes only these core workflows. Legacy and diagnostic commands such as `/oi_report`, `/scan`, `/universe`, and detailed settings remain callable for backward compatibility but are hidden from the menu.
 
+Automatic notifications use compact PNG cards by default (`TELEGRAM_CARD_MODE=1`). The hourly TOP 5 is combined into one ranking card; transition, OI spike, position, strategy, and daily-summary events use one action card each. Full text remains in persisted JSON/report files, and Telegram falls back to text if card rendering or `sendPhoto` fails. `/report`, `/strategy_report`, and `/positions` also return cards; detailed research commands remain text-first.
+
 ## WGL Report Format
 
 The hourly scanner first evaluates closed daily candles across the full universe, then runs deeper OI, funding, spot-flow, order-book, and verified on-chain checks. Deep-analysis capacity is split between long-bottom structures and a reserved live-momentum lane, so strong OI/price expansion cannot be removed by the bottom-structure ranking alone. The card separates:
