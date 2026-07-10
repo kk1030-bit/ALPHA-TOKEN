@@ -59,6 +59,9 @@ class DepthSnapshot:
     imbalance_20: float | None
     imbalance_50: float | None
     bid_ask_ratio_50: float | None
+    taker_buy_notional: float | None
+    taker_sell_notional: float | None
+    trade_imbalance: float | None
 
 
 @dataclass
@@ -78,6 +81,8 @@ class OrderbookSignal:
     bid_depth_change_pct: float | None = None
     depth_churn_pct: float | None = None
     spread_pct: float | None = None
+    avg_trade_imbalance: float | None = None
+    latest_trade_imbalance: float | None = None
     reasons: list[str] | None = None
 
 
@@ -160,6 +165,21 @@ def fetch_depth_snapshot(symbol: str, *, limit: int = 50) -> DepthSnapshot:
     ask_20 = _sum_notional(asks, 20)
     bid_50 = _sum_notional(bids, 50)
     ask_50 = _sum_notional(asks, 50)
+    trades = _get_json("/fapi/v1/aggTrades", {"symbol": symbol, "limit": 500})
+    taker_buy = 0.0
+    taker_sell = 0.0
+    for trade in trades if isinstance(trades, list) else []:
+        price = _to_float(trade.get("p"))
+        quantity = _to_float(trade.get("q"))
+        if price is None or quantity is None:
+            continue
+        notional = price * quantity
+        if bool(trade.get("m")):
+            taker_sell += notional
+        else:
+            taker_buy += notional
+    trade_total = taker_buy + taker_sell
+    trade_imbalance = (taker_buy - taker_sell) / trade_total if trade_total > 0 else None
     return DepthSnapshot(
         symbol=symbol,
         ts=float(int(time.time())),
@@ -172,6 +192,9 @@ def fetch_depth_snapshot(symbol: str, *, limit: int = 50) -> DepthSnapshot:
         imbalance_20=_imbalance(bid_20, ask_20),
         imbalance_50=_imbalance(bid_50, ask_50),
         bid_ask_ratio_50=_ratio(bid_50, ask_50),
+        taker_buy_notional=taker_buy if trade_total > 0 else None,
+        taker_sell_notional=taker_sell if trade_total > 0 else None,
+        trade_imbalance=trade_imbalance,
     )
 
 
@@ -193,6 +216,9 @@ def init_orderbook_db(db_path: Path) -> None:
                 imbalance_20 REAL,
                 imbalance_50 REAL,
                 bid_ask_ratio_50 REAL,
+                taker_buy_notional REAL,
+                taker_sell_notional REAL,
+                trade_imbalance REAL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(symbol, ts)
             )
@@ -201,6 +227,10 @@ def init_orderbook_db(db_path: Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_ts ON orderbook_snapshots(symbol, ts)"
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(orderbook_snapshots)")}
+        for name in ("taker_buy_notional", "taker_sell_notional", "trade_imbalance"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE orderbook_snapshots ADD COLUMN {name} REAL")
 
 
 def save_depth_snapshot(db_path: Path, snapshot: DepthSnapshot) -> None:
@@ -212,8 +242,9 @@ def save_depth_snapshot(db_path: Path, snapshot: DepthSnapshot) -> None:
                 symbol, ts, mid_price, spread_pct,
                 bid_notional_20, ask_notional_20,
                 bid_notional_50, ask_notional_50,
-                imbalance_20, imbalance_50, bid_ask_ratio_50
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                imbalance_20, imbalance_50, bid_ask_ratio_50,
+                taker_buy_notional, taker_sell_notional, trade_imbalance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.symbol,
@@ -227,6 +258,9 @@ def save_depth_snapshot(db_path: Path, snapshot: DepthSnapshot) -> None:
                 snapshot.imbalance_20,
                 snapshot.imbalance_50,
                 snapshot.bid_ask_ratio_50,
+                snapshot.taker_buy_notional,
+                snapshot.taker_sell_notional,
+                snapshot.trade_imbalance,
             ),
         )
 
@@ -283,7 +317,8 @@ def _rows_for_symbol(db_path: Path, symbol: str, lookback_seconds: int) -> list[
             """
             SELECT symbol, ts, mid_price, spread_pct,
                    bid_notional_50, ask_notional_50,
-                   imbalance_50, bid_ask_ratio_50
+                   imbalance_50, bid_ask_ratio_50,
+                   taker_buy_notional, taker_sell_notional, trade_imbalance
             FROM orderbook_snapshots
             WHERE symbol = ? AND ts >= ?
             ORDER BY ts ASC
@@ -353,6 +388,7 @@ def analyze_orderbook_accumulation(
     bid_depths = [_to_float(row.get("bid_notional_50")) for row in rows]
     ask_depths = [_to_float(row.get("ask_notional_50")) for row in rows]
     spreads = [_to_float(row.get("spread_pct")) for row in rows]
+    trade_imbalances = [_to_float(row.get("trade_imbalance")) for row in rows]
     totals = [
         (bid or 0.0) + (ask or 0.0)
         for bid, ask in zip(bid_depths, ask_depths)
@@ -368,7 +404,9 @@ def analyze_orderbook_accumulation(
     last_ratio = _median(ratios[-window:])
     latest = rows[-1]
     latest_imbalance = _to_float(latest.get("imbalance_50"))
+    latest_trade_imbalance = _to_float(latest.get("trade_imbalance"))
     avg_imbalance = _avg(imbalances)
+    avg_trade_imbalance = _avg(trade_imbalances[-window:])
     positive_ratio = (
         sum(1 for value in imbalances if value is not None and value >= 0.25)
         / max(1, len([value for value in imbalances if value is not None]))
@@ -424,9 +462,28 @@ def analyze_orderbook_accumulation(
         score += 8
         reasons.append(f"買賣比隱性墊高：{_fmt_pct(ratio_change)}，最新 {_fmt_ratio(last_ratio)}")
 
+    if avg_trade_imbalance is not None and avg_trade_imbalance >= 0.15:
+        score += 18
+        reasons.append(f"實際主動買盤占優：{_fmt_pct(avg_trade_imbalance * 100)}")
+    elif avg_trade_imbalance is not None and avg_trade_imbalance <= -0.15:
+        score -= 18
+        reasons.append(f"實際主動賣盤占優：{_fmt_pct(avg_trade_imbalance * 100)}")
+    if (
+        avg_imbalance is not None
+        and avg_imbalance >= 0.25
+        and avg_trade_imbalance is not None
+        and avg_trade_imbalance <= -0.10
+    ):
+        score -= 22
+        reasons.append("掛單顯示買牆，但實際成交偏賣，疑似假牆")
+
     if depth_churn is not None and depth_churn >= 12:
-        score += 10
-        reasons.append(f"深度結構異常變動：平均 {_fmt_pct(depth_churn)} / 快照")
+        if avg_trade_imbalance is not None and avg_trade_imbalance > 0.05:
+            score += 5
+            reasons.append(f"深度變動且成交確認：平均 {_fmt_pct(depth_churn)} / 快照")
+        else:
+            score -= 8
+            reasons.append(f"撤掛過快且成交未確認：平均 {_fmt_pct(depth_churn)} / 快照")
     elif depth_churn is not None and depth_churn >= 6:
         score += 5
         reasons.append(f"深度結構有活動：平均 {_fmt_pct(depth_churn)} / 快照")
@@ -466,6 +523,8 @@ def analyze_orderbook_accumulation(
         bid_depth_change_pct=bid_depth_change,
         depth_churn_pct=depth_churn,
         spread_pct=spread,
+        avg_trade_imbalance=avg_trade_imbalance,
+        latest_trade_imbalance=latest_trade_imbalance,
         reasons=reasons,
     )
 
@@ -483,6 +542,10 @@ def format_orderbook_signal(signal: OrderbookSignal) -> str:
         (
             f"Ask變化 {_fmt_pct(signal.ask_depth_change_pct)}｜Bid變化 {_fmt_pct(signal.bid_depth_change_pct)}"
             f"｜買賣比變化 {_fmt_pct(signal.bid_ask_ratio_change_pct)}｜深度異動 {_fmt_pct(signal.depth_churn_pct)}"
+        ),
+        (
+            f"實際成交方向：最新 {_fmt_pct((signal.latest_trade_imbalance or 0) * 100) if signal.latest_trade_imbalance is not None else 'n/a'}"
+            f"｜均值 {_fmt_pct((signal.avg_trade_imbalance or 0) * 100) if signal.avg_trade_imbalance is not None else 'n/a'}"
         ),
     ]
     if reasons:

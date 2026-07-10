@@ -13,7 +13,9 @@ from typing import Any
 
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 ARKHAM_BASE_URL = "https://api.arkm.com"
+COINGECKO_COIN_URL = "https://api.coingecko.com/api/v3/coins"
 DEFAULT_TIMEOUT = 15
+CONTRACT_CACHE: dict[str, dict[str, Any]] = {}
 
 
 @dataclass
@@ -42,6 +44,11 @@ class OnchainSignal:
     cex_inflow_24h_usd: float | None = None
     bitget_inflow_24h_usd: float | None = None
     cex_outflow_24h_usd: float | None = None
+    provider_id: str | None = None
+    identity_verified: bool = False
+    identity_source: str = "symbol-only"
+    data_confidence_pct: int = 0
+    cex_flow_available: bool = False
 
 
 def _get_json(url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
@@ -149,7 +156,10 @@ def _pair_score(pair: dict[str, Any], symbol: str) -> tuple[int, int, int, float
     return base_exact, quote_exact, activity, volume_24h, txns_24h, liquidity
 
 
-def search_dex_pair(query_symbol: str) -> dict[str, Any] | None:
+def search_dex_pair(
+    query_symbol: str,
+    verified_contracts: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     if len(query_symbol.strip()) < 2:
         return None
     data = _get_json(DEXSCREENER_SEARCH_URL, {"q": query_symbol})
@@ -157,11 +167,68 @@ def search_dex_pair(query_symbol: str) -> dict[str, Any] | None:
     if not isinstance(pairs, list):
         return None
     exact_pairs = [pair for pair in pairs if isinstance(pair, dict) and _pair_token_for_symbol(pair, query_symbol)]
+    if verified_contracts:
+        verified_pairs = []
+        for pair in exact_pairs:
+            chain = str(pair.get("chainId") or "").lower()
+            token = _pair_token_for_symbol(pair, query_symbol) or {}
+            address = str(token.get("address") or "").lower()
+            expected = str(verified_contracts.get(chain) or "").lower()
+            if address and expected and address == expected:
+                verified_pairs.append(pair)
+        if verified_pairs:
+            return max(verified_pairs, key=lambda pair: _pair_score(pair, query_symbol))
     active_exact_pairs = [pair for pair in exact_pairs if _pair_activity(pair)[0] > 0]
     candidates = active_exact_pairs or exact_pairs or [pair for pair in pairs if isinstance(pair, dict)]
     if not candidates:
         return None
     return max(candidates, key=lambda pair: _pair_score(pair, query_symbol))
+
+
+def _coingecko_contracts(provider_id: str | None) -> tuple[dict[str, str], str | None]:
+    provider_id = str(provider_id or "").strip().lower()
+    if not provider_id:
+        return {}, "缺少可驗證的代幣身分 ID"
+    cached = CONTRACT_CACHE.get(provider_id)
+    if cached and time.time() - float(cached.get("ts", 0.0)) < 86400:
+        return dict(cached.get("contracts") or {}), cached.get("warning")
+
+    chain_map = {
+        "ethereum": "ethereum",
+        "binance-smart-chain": "bsc",
+        "base": "base",
+        "arbitrum-one": "arbitrum",
+        "polygon-pos": "polygon",
+        "optimistic-ethereum": "optimism",
+        "avalanche": "avalanche",
+        "solana": "solana",
+        "tron": "tron",
+        "sui": "sui",
+    }
+    try:
+        payload = _get_json(
+            f"{COINGECKO_COIN_URL}/{urllib.parse.quote(provider_id)}",
+            {
+                "localization": "false",
+                "tickers": "false",
+                "market_data": "false",
+                "community_data": "false",
+                "developer_data": "false",
+                "sparkline": "false",
+            },
+        )
+        platforms = payload.get("platforms") if isinstance(payload, dict) else None
+        contracts = {
+            chain_map[chain]: str(address).strip()
+            for chain, address in (platforms or {}).items()
+            if chain in chain_map and str(address or "").strip()
+        }
+        warning = None if contracts else "CoinGecko 沒有提供可驗證合約地址"
+    except Exception as exc:
+        contracts = {}
+        warning = f"合約地址查詢失敗：{exc}"
+    CONTRACT_CACHE[provider_id] = {"ts": time.time(), "contracts": contracts, "warning": warning}
+    return contracts, warning
 
 
 def _transfer_rows(payload: Any) -> list[dict[str, Any]]:
@@ -269,13 +336,21 @@ def analyze_onchain(
     raw_symbol: str,
     *,
     market_symbol: str | None = None,
+    provider_id: str | None = None,
     arkham_api_key: str | None = None,
     arkham_min_usd: float | None = None,
 ) -> OnchainSignal:
     query_symbol = _base_symbol(market_symbol or raw_symbol)
-    signal = OnchainSignal(symbol=raw_symbol.upper(), query_symbol=query_symbol, verdict="中性", score=0)
+    signal = OnchainSignal(
+        symbol=raw_symbol.upper(),
+        query_symbol=query_symbol,
+        verdict="中性",
+        score=0,
+        provider_id=provider_id,
+    )
 
-    pair = search_dex_pair(query_symbol)
+    verified_contracts, identity_warning = _coingecko_contracts(provider_id)
+    pair = search_dex_pair(query_symbol, verified_contracts)
     if pair is None:
         signal.verdict = "再確認"
         signal.warnings.append("DexScreener 找不到主要交易對，無法做鏈上/DEX 初篩。")
@@ -297,6 +372,20 @@ def analyze_onchain(
     signal.sells_1h = _to_int(_nested(pair, "txns", "h1", "sells"))
     signal.marketcap_usd = _to_float(pair.get("marketCap"))
     signal.fdv_usd = _to_float(pair.get("fdv"))
+    expected_address = str(verified_contracts.get(signal.chain_id.lower()) or "").lower()
+    signal.identity_verified = bool(
+        expected_address and signal.token_address and signal.token_address.lower() == expected_address
+    )
+    if signal.identity_verified:
+        signal.identity_source = "coingecko-contract"
+        signal.data_confidence_pct = 70
+    else:
+        signal.identity_source = "symbol-only"
+        signal.data_confidence_pct = 30
+        if identity_warning:
+            signal.warnings.append(identity_warning)
+        elif verified_contracts:
+            signal.warnings.append("DexScreener 交易對地址與已知合約不一致，僅作參考。")
 
     liq = signal.liquidity_usd or 0.0
     vol24 = signal.volume_24h_usd or 0.0
@@ -322,15 +411,6 @@ def analyze_onchain(
     elif dex_low_activity:
         signal.score -= 1
         signal.reasons.append(f"24h 成交量/流動性只有 {vol24 / liq:.4f}x，活躍度偏低。")
-
-    if signal.marketcap_usd and signal.marketcap_usd > 0 and liq > 0:
-        liq_to_mcap = liq / signal.marketcap_usd * 100.0
-        if liq_to_mcap >= 2:
-            signal.score += 1
-            signal.reasons.append(f"流動性/市值 {liq_to_mcap:.2f}%，承接較健康。")
-        elif liq_to_mcap < 0.5:
-            signal.score -= 1
-            signal.reasons.append(f"流動性/市值只有 {liq_to_mcap:.2f}%，承接偏弱。")
 
     if liq > 0 and vol24 / liq >= 1.5 and (price24 is None or price24 > -10):
         signal.score += 1
@@ -365,7 +445,7 @@ def analyze_onchain(
 
     api_key = arkham_api_key or os.environ.get("ARKHAM_API_KEY", "")
     min_usd = arkham_min_usd or _to_float(os.environ.get("ONCHAIN_ARKHAM_MIN_USD")) or 50_000.0
-    if api_key:
+    if api_key and signal.identity_verified:
         try:
             bitget_usd, _, warn = _arkham_transfers(
                 api_key,
@@ -393,6 +473,8 @@ def analyze_onchain(
             signal.bitget_inflow_24h_usd = bitget_usd
             signal.cex_inflow_24h_usd = cex_in_usd
             signal.cex_outflow_24h_usd = cex_out_usd
+            signal.cex_flow_available = True
+            signal.data_confidence_pct = 100
             for warn_item in (warn, warn2, warn3):
                 if warn_item:
                     signal.warnings.append(warn_item)
@@ -411,8 +493,10 @@ def analyze_onchain(
                 signal.reasons.append(f"24h 有 CEX 出金：{_format_usd(cex_out_usd)}。")
         except Exception as exc:
             signal.warnings.append(f"Arkham 查詢失敗：{exc}")
-    else:
+    elif not api_key:
         signal.warnings.append("尚未設定 ARKHAM_API_KEY，所以未檢查 Bitget/CEX 入金。")
+    else:
+        signal.warnings.append("合約地址尚未驗證，不查詢 CEX 流向以避免誤判。")
 
     if dex_inactive:
         signal.score = min(signal.score, -1)
@@ -438,6 +522,10 @@ def format_onchain_report(signal: OnchainSignal) -> str:
     lines = [
         f"鏈上檢查｜{signal.symbol}",
         f"判定：{signal.verdict}｜分數 {signal.score:+d}",
+        (
+            f"身分：{'合約地址已驗證' if signal.identity_verified else '僅符號比對，不計入總分'}"
+            f"｜資料完整度 {signal.data_confidence_pct}%"
+        ),
     ]
     if signal.token_address:
         lines.append(f"鏈：{signal.chain_id}｜合約：{signal.token_address}")

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import math
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -40,6 +43,14 @@ from oi_service import (
     save_analysis,
     scan_symbols,
 )
+from wgl_v3 import (
+    STRUCTURE_MODEL_VERSION,
+    TRIGGER_STATES,
+    component_scores as v3_component_scores,
+    live_momentum_score,
+    migrate_structure_screen,
+    scan_structure_universe,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -54,6 +65,12 @@ WGL_SEEN_SYMBOLS_PATH = ROOT / "data" / "wgl_seen_symbols"
 WGL_SYMBOL_STATS_PATH = ROOT / "data" / "wgl_symbol_stats.json"
 WGL_DAILY_SUMMARIES_PATH = ROOT / "data" / "wgl_daily_summaries"
 WGL_DAILY_SUMMARY_STATE_PATH = ROOT / "data" / "wgl_daily_summary_state.json"
+WGL_FULL_SCAN_EVENTS_PATH = ROOT / "data" / "wgl_scans"
+WGL_LATEST_REPORT_PATH = ROOT / "data" / "latest_wgl_report.json"
+WGL_SIGNAL_STATES_PATH = ROOT / "data" / "wgl_signal_states.json"
+WGL_SIGNAL_OUTCOMES_PATH = ROOT / "data" / "wgl_signal_outcomes.json"
+WGL_TRANSITIONS_PATH = ROOT / "data" / "wgl_transitions"
+STRUCTURE_CACHE_PATH = ROOT / "data" / "wgl_structure_cache.json"
 DEFAULT_TOKEN_EXCEL_PATH = ROOT / "tokens.xlsx"
 WATCH_CACHE: dict[str, Any] = {"expires_at": 0.0, "symbols": []}
 RUNTIME_SPIKE_HISTORY: dict[str, deque[dict[str, Any]]] = {}
@@ -61,7 +78,14 @@ RUNTIME_POSITION_HISTORY: dict[str, deque[dict[str, Any]]] = {}
 RUNTIME_ONCHAIN_OBSERVE_AT: dict[str, float] = {}
 RUNTIME_FUNDING_CACHE: dict[str, dict[str, Any]] = {}
 RUNTIME_WGL_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
+RUNTIME_STRUCTURE_CACHE: dict[str, dict[str, Any]] = {}
+RUNTIME_SPOT_FLOW_CACHE: dict[str, dict[str, Any]] = {}
+RUNTIME_TRANSITION_ALERTS: deque[str] = deque()
+RUNTIME_TRANSITION_LOCK = threading.Lock()
+RUNTIME_ORDERBOOK_LOCK = threading.Lock()
 RUNTIME_BINANCE_BACKOFF_UNTIL = 0.0
+RUNTIME_SPIKE_CURSOR = 0
+BOT_STARTED_AT = time.time()
 
 
 def load_env(path: Path) -> None:
@@ -90,6 +114,23 @@ def telegram_call(token: str, method: str, params: dict[str, Any] | None = None,
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram API error: {payload}")
     return payload.get("result")
+
+
+def initialize_update_offset(token: str) -> int:
+    """Start from the newest Telegram update so old /report requests do not backlog after restart."""
+    try:
+        updates = telegram_call(
+            token,
+            "getUpdates",
+            {"offset": -1, "limit": 1, "timeout": 1, "allowed_updates": json.dumps(["message"])},
+            timeout=5,
+        )
+    except Exception as exc:
+        print(f"Telegram offset init failed: {exc}", file=sys.stderr, flush=True)
+        return 0
+    if not updates:
+        return 0
+    return max(int(update.get("update_id", 0)) for update in updates) + 1
 
 
 def allowed_chat(chat_id: int, allowed: set[int]) -> bool:
@@ -224,10 +265,6 @@ def report_lookback_seconds() -> int:
     return env_int("REPORT_LOOKBACK_SECONDS", 3600, 300)
 
 
-def watch_min_market_rank() -> int:
-    return env_int("WATCH_MIN_MARKET_RANK", 101, 1)
-
-
 def watchlist_refresh_seconds() -> int:
     return env_int("WATCHLIST_REFRESH_SECONDS", 600, 60)
 
@@ -267,6 +304,19 @@ def spike_check_seconds() -> int:
     return env_int("OI_SPIKE_CHECK_SECONDS", 30, 10)
 
 
+def spike_batch_size() -> int:
+    return env_int("OI_SPIKE_BATCH_SIZE", 220, 20)
+
+
+def effective_spike_batch_size(universe_size: int) -> int:
+    if universe_size <= 0:
+        return 0
+    minimum_batch = math.ceil(
+        universe_size * spike_check_seconds() / max(spike_check_seconds(), spike_window_seconds() / 2)
+    )
+    return min(universe_size, max(spike_batch_size(), minimum_batch))
+
+
 def spike_min_change_pct() -> float:
     return env_float("OI_SPIKE_MIN_CHANGE_PCT", 8.0, 0.1)
 
@@ -285,6 +335,46 @@ def spike_price_confirm_pct() -> float:
 
 def spike_cooldown_seconds() -> int:
     return env_int("OI_SPIKE_COOLDOWN_SECONDS", 900, 60)
+
+
+def trend_window_seconds() -> int:
+    return env_int("OI_TREND_WINDOW_SECONDS", 3600, 900)
+
+
+def trend_min_contracts_pct() -> float:
+    return env_float("OI_TREND_MIN_CONTRACTS_PCT", 5.0, 0.1)
+
+
+def trend_min_price_pct() -> float:
+    return env_float("OI_TREND_MIN_PRICE_PCT", 0.5, 0.0)
+
+
+def trend_max_bottom_price_pct() -> float:
+    return env_float("OI_TREND_MAX_BOTTOM_PRICE_PCT", 12.0, 1.0)
+
+
+def momentum_min_contracts_pct() -> float:
+    return env_float("OI_MOMENTUM_MIN_CONTRACTS_PCT", 8.0, 0.1)
+
+
+def momentum_min_price_pct() -> float:
+    return env_float("OI_MOMENTUM_MIN_PRICE_PCT", 3.0, 0.1)
+
+
+def momentum_strong_contracts_pct() -> float:
+    return env_float("OI_MOMENTUM_STRONG_CONTRACTS_PCT", 15.0, 0.1)
+
+
+def momentum_strong_min_price_pct() -> float:
+    return env_float("OI_MOMENTUM_STRONG_MIN_PRICE_PCT", 1.0, 0.1)
+
+
+def trend_max_momentum_price_pct() -> float:
+    return env_float("OI_TREND_MAX_MOMENTUM_PRICE_PCT", 20.0, 1.0)
+
+
+def trend_cooldown_seconds() -> int:
+    return env_int("OI_TREND_COOLDOWN_SECONDS", 3600, 300)
 
 
 def position_check_seconds() -> int:
@@ -309,6 +399,10 @@ def position_take_profit_pct() -> float:
 
 def strategy_report_interval_seconds() -> int:
     return env_int("STRATEGY_REPORT_INTERVAL_SECONDS", 10800, 900)
+
+
+def strategy_scan_interval_seconds() -> int:
+    return env_int("STRATEGY_SCAN_INTERVAL_SECONDS", 300, 60)
 
 
 def strategy_take_profit_pct() -> float:
@@ -337,22 +431,6 @@ def strategy_base_window_seconds() -> int:
 
 def strategy_max_funding_pct() -> float:
     return env_float("STRATEGY_MAX_FUNDING_PCT", 0.06, 0.0)
-
-
-def strategy_min_marketcap_usd() -> float:
-    return env_float("STRATEGY_MIN_MARKETCAP_USD", 5_000_000.0, 0.0)
-
-
-def strategy_max_marketcap_usd() -> float:
-    return env_float("STRATEGY_MAX_MARKETCAP_USD", 500_000_000.0, 0.0)
-
-
-def strategy_min_oi_to_mcap_pct() -> float:
-    return env_float("STRATEGY_MIN_OI_TO_MCAP_PCT", 1.0, 0.0)
-
-
-def strategy_max_oi_to_mcap_pct() -> float:
-    return env_float("STRATEGY_MAX_OI_TO_MCAP_PCT", 70.0, 1.0)
 
 
 def strategy_max_extension_from_low_pct() -> float:
@@ -548,7 +626,19 @@ def onchain_report_interval_seconds() -> int:
 
 
 def onchain_report_candidate_count() -> int:
-    return env_int("ONCHAIN_REPORT_CANDIDATES", 30, 5)
+    return env_int("ONCHAIN_REPORT_CANDIDATES", 50, 5)
+
+
+def momentum_deep_quota() -> int:
+    return env_int("MOMENTUM_DEEP_QUOTA", 15, 0)
+
+
+def onchain_deep_candidate_count() -> int:
+    return env_int("ONCHAIN_DEEP_CANDIDATES", 10, 1)
+
+
+def spot_flow_candidate_count() -> int:
+    return env_int("SPOT_FLOW_CANDIDATES", 12, 1)
 
 
 def onchain_report_top_n() -> int:
@@ -577,7 +667,11 @@ def orderbook_collect_interval_seconds() -> int:
 
 
 def orderbook_watch_candidates() -> int:
-    return env_int("ORDERBOOK_WATCH_CANDIDATES", 100, 5)
+    return env_int("ORDERBOOK_WATCH_CANDIDATES", 10, 5)
+
+
+def orderbook_report_seed_candidates() -> int:
+    return env_int("ORDERBOOK_REPORT_SEED_CANDIDATES", 10, 1)
 
 
 def orderbook_workers() -> int:
@@ -605,7 +699,27 @@ def composite_report_top_n() -> int:
 
 
 def structure_scan_candidate_count() -> int:
-    return env_int("STRUCTURE_SCAN_CANDIDATES", 30, 5)
+    return env_int("STRUCTURE_SCAN_CANDIDATES", 20, 5)
+
+
+def structure_cache_seconds() -> int:
+    return env_int("STRUCTURE_CACHE_SECONDS", 21600, 900)
+
+
+def structure_scan_workers() -> int:
+    return env_int("STRUCTURE_SCAN_WORKERS", 8, 1)
+
+
+def structure_refresh_batch_size() -> int:
+    return env_int("STRUCTURE_REFRESH_BATCH_SIZE", 60, 10)
+
+
+def structure_reference_symbols() -> set[str]:
+    raw = os.environ.get(
+        "STRUCTURE_REFERENCE_SYMBOLS",
+        "RAVEUSDT,LABUSDT,MYXUSDT,COAIUSDT,BEATUSDT,BLESSUSDT",
+    )
+    return {normalize_symbol(value) for value in raw.split(",") if value.strip()}
 
 
 def wgl_scan_candidate_count() -> int:
@@ -614,18 +728,6 @@ def wgl_scan_candidate_count() -> int:
 
 def wgl_min_score() -> int:
     return env_int("WGL_MIN_SCORE", 45, 1)
-
-
-def wgl_open_max_rank() -> int:
-    return env_int("WGL_OPEN_MAX_RANK", 2, 1)
-
-
-def wgl_open_min_score() -> int:
-    return env_int("WGL_OPEN_MIN_SCORE", 60, 1)
-
-
-def wgl_ignition_min_score() -> int:
-    return env_int("WGL_IGNITION_MIN_SCORE", 55, 1)
 
 
 def wgl_pullback_min_score() -> int:
@@ -650,10 +752,6 @@ def wgl_pullback_max_6h_range_position_pct() -> float:
 
 def wgl_pullback_max_funding_pct() -> float:
     return env_float("WGL_PULLBACK_MAX_FUNDING_PCT", 0.06, 0.0)
-
-
-def wgl_pullback_min_oi_to_mcap_pct() -> float:
-    return env_float("WGL_PULLBACK_MIN_OI_TO_MCAP_PCT", 15.0, 0.0)
 
 
 def wgl_pullback_min_volume_ratio() -> float:
@@ -766,7 +864,7 @@ def resolve_watch_symbols(*, force_refresh: bool = False) -> list[WatchSymbol]:
     seen = set()
 
     if mode in {"dynamic", "both"}:
-        for watch in get_dynamic_watch_symbols(min_market_rank=watch_min_market_rank()):
+        for watch in get_dynamic_watch_symbols():
             symbols.append(watch)
             seen.add(watch.symbol)
 
@@ -799,9 +897,9 @@ def resolve_watch_symbols(*, force_refresh: bool = False) -> list[WatchSymbol]:
 def watch_source_description() -> str:
     mode = watch_mode()
     if mode == "dynamic":
-        return f"CryptoBubbles 市值排名 >= {watch_min_market_rank()}，且 Binance Futures 有 OI"
+        return "全部 Binance USDT 合約；CryptoBubbles 市值與排名只作參考"
     if mode == "both":
-        return f"CryptoBubbles 市值排名 >= {watch_min_market_rank()} 且 Binance Futures 有 OI，加上 Excel 補充名單"
+        return "全部 Binance USDT 合約，加上 Excel 補充名單；不設市值條件"
     return f"只使用 Excel：{token_excel_path()}"
 
 
@@ -978,14 +1076,10 @@ def attention_signal(metrics: dict[str, float | None]) -> str:
         if price is not None and price <= -spike_price_confirm_pct():
             return "空頭建倉"
         return "倉位堆積"
-    oi_to_mcap = metrics.get("oi_to_marketcap_pct")
-    if oi_to_mcap is not None and oi_to_mcap >= 30:
-        return "高槓桿擁擠"
     return "觀察"
 
 
 def report_decision(row: Any, metrics: dict[str, float | None], score: int) -> tuple[str, str]:
-    oi_to_mcap = metrics.get("oi_to_marketcap_pct")
     c180 = metrics.get("contracts_180s_pct")
     c1h = metrics.get("contracts_1h_pct")
     p180 = metrics.get("price_180s_pct")
@@ -994,13 +1088,9 @@ def report_decision(row: Any, metrics: dict[str, float | None], score: int) -> t
     funding_abs = abs(funding) if funding is not None else None
     funding_hot = funding_abs is not None and funding_abs >= 0.25
     funding_warm = funding_abs is not None and funding_abs >= 0.10
-    has_oi_history = c180 is not None or c1h is not None
     contracts_confirmed = (c180 is not None and c180 >= spike_min_contracts_pct()) or (c1h is not None and c1h >= 5)
     price_pumped = p180 is not None and p180 >= 1.5
     price_up_without_oi = p180 is not None and p180 >= spike_price_confirm_pct() and (c180 is None or c180 < 1)
-    high_leverage = oi_to_mcap is not None and oi_to_mcap >= 30
-    strong_leverage = oi_to_mcap is not None and oi_to_mcap >= 50
-    extreme_leverage = oi_to_mcap is not None and oi_to_mcap >= 60
 
     if funding_hot:
         side = "多方" if funding and funding > 0 else "空方"
@@ -1009,12 +1099,6 @@ def report_decision(row: Any, metrics: dict[str, float | None], score: int) -> t
         return "不要進", "價格拉升但合約OI沒跟，疑似誘多"
     if price_pumped and not contracts_confirmed:
         return "不要進", "價格已先拉，OI確認不足，不追"
-    if extreme_leverage and funding_warm:
-        return "不要進", "OI/市值極高且 funding 偏熱，風險過擠"
-
-    if strong_leverage and not funding_warm and not price_pumped and score >= 45:
-        return "埋伏", "OI/市值偏高且 funding 未過熱"
-
     if contracts_confirmed and not funding_warm:
         if p180 is not None and p180 <= -spike_price_confirm_pct():
             return "再確認", "OI增加但價格走弱，先等翻強"
@@ -1022,8 +1106,6 @@ def report_decision(row: Any, metrics: dict[str, float | None], score: int) -> t
             return "再確認", "OI增加但需確認不是短線出貨"
         return "再確認", "OI有進場，但價格已動，等回踩確認"
 
-    if high_leverage:
-        return "再確認", "OI/市值高，但強度未達埋伏門檻"
     if score >= 45:
         return "再確認", "分數不低，但方向仍需價格與OI同步"
     return "再確認", "訊號不足，等 OI 或價格確認"
@@ -1036,19 +1118,6 @@ def decision_order(label: str) -> int:
 
 def attention_score(row: Any, metrics: dict[str, float | None]) -> int:
     score = 0.0
-    oi_to_mcap = metrics.get("oi_to_marketcap_pct")
-    if oi_to_mcap is not None:
-        if oi_to_mcap >= 50:
-            score += 36
-        elif oi_to_mcap >= 30:
-            score += 30
-        elif oi_to_mcap >= 15:
-            score += 22
-        elif oi_to_mcap >= 8:
-            score += 14
-        elif oi_to_mcap >= 3:
-            score += 8
-
     c180 = metrics.get("contracts_180s_pct")
     if c180 is not None:
         if c180 >= 8:
@@ -1082,9 +1151,6 @@ def attention_score(row: Any, metrics: dict[str, float | None]) -> int:
             score += 3
         else:
             score -= 8
-
-    if row.market_rank is not None and row.market_rank >= 300:
-        score += 5
 
     return max(0, min(100, int(round(score))))
 
@@ -1125,7 +1191,6 @@ def build_oi_report(history: dict[str, deque[dict[str, Any]]] | None = None) -> 
     scored_rows.sort(
         key=lambda item: (
             item["score"],
-            item["metrics"]["oi_to_marketcap_pct"] or 0,
             item["row"].oi_value_usd or 0,
         ),
         reverse=True,
@@ -1140,7 +1205,7 @@ def build_oi_report(history: dict[str, deque[dict[str, Any]]] | None = None) -> 
     counts = {label: sum(1 for item in top_rows if item["decision"] == label) for label in labels}
     lines = [
         f"階段 OI 雷達前 {min(top_n, len(rows))}｜埋伏A {counts['埋伏A']}｜埋伏B {counts['埋伏B']}｜再確認 {counts['再確認']}｜不要進 {counts['不要進']}",
-        f"監控：{len(rows)}/{len(all_rows)} 可查 OI｜來源：市值排名100名外 + Binance Futures",
+        f"監控：{len(rows)}/{len(all_rows)} 可查 OI｜來源：Binance 全部 USDT 合約（無市值門檻）",
         "判讀：埋伏A=早期推升；埋伏B=洗盤收回；再確認=方向未明；不要進=尾端/誘多/過熱。",
     ]
     if unsupported_count:
@@ -1193,6 +1258,12 @@ def save_wgl_report_event(candidates: list[dict[str, Any]], report_text: str) ->
                 "report_rank": item.get("report_rank", idx),
                 "symbol": item.get("symbol"),
                 "score": item.get("score"),
+                "signal_state": item.get("signal_state"),
+                "structure_score": item.get("structure_score"),
+                "capital_score": item.get("capital_score"),
+                "trigger_score": item.get("trigger_score"),
+                "quality_score": item.get("quality_score"),
+                "risk_score": item.get("risk_score"),
                 "labels": item.get("labels"),
                 "reasons": item.get("reasons") or [],
                 "trade_bucket": item.get("trade_bucket"),
@@ -1222,6 +1293,411 @@ def save_wgl_report_event(candidates: list[dict[str, Any]], report_text: str) ->
         )
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def save_wgl_full_scan_event(
+    candidates: list[dict[str, Any]],
+    selected_symbols: set[str],
+    deep_candidates: list[dict[str, Any]] | None = None,
+    component_candidates: list[dict[str, Any]] | None = None,
+) -> None:
+    WGL_FULL_SCAN_EVENTS_PATH.mkdir(parents=True, exist_ok=True)
+    path = WGL_FULL_SCAN_EVENTS_PATH / f"{time.strftime('%Y%m%d')}.jsonl"
+    event = {
+        "schema": "wgl-full-universe-v3",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp_local": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "universe_size": len(candidates),
+        "selected_count": len(selected_symbols),
+        "items": [],
+    }
+    deep_by_symbol = {
+        item["row"].symbol: item
+        for item in (deep_candidates or [])
+    }
+    component_by_symbol = {
+        str(item.get("symbol") or "").upper(): item
+        for item in (component_candidates or [])
+    }
+    for item in candidates:
+        deep = deep_by_symbol.get(item["row"].symbol) or item
+        row = deep["row"]
+        screen = item.get("structure_screen") or {}
+        metrics = deep.get("metrics") or {}
+        component = component_by_symbol.get(str(row.symbol).upper()) or {}
+        event["items"].append(
+            {
+                "symbol": row.symbol,
+                "selected_for_deep_scan": row.symbol in selected_symbols,
+                "structure_score": screen.get("score"),
+                "structure_eligible": bool(screen.get("eligible")),
+                "structure_state": screen.get("state_hint"),
+                "rejection_reason": screen.get("reject_reason") or "",
+                "prefilter_score": deep.get("prefilter_score") or item.get("prefilter_score"),
+                "live_momentum_score": deep.get("live_momentum_score") or item.get("live_momentum_score"),
+                "momentum_rank_score": deep.get("momentum_rank_score"),
+                "selection_lane": deep.get("selection_lane"),
+                "mark_price": to_float(getattr(row, "mark_price", None)),
+                "funding_rate_pct": to_float(getattr(row, "funding_rate_pct", None)),
+                "oi_value_usd": to_float(getattr(row, "oi_value_usd", None)),
+                "contracts_180s_pct": to_float(metrics.get("contracts_180s_pct")),
+                "contracts_1h_pct": to_float(metrics.get("contracts_1h_pct")),
+                "price_180s_pct": to_float(metrics.get("price_180s_pct")),
+                "price_1h_pct": to_float(metrics.get("price_1h_pct")),
+                "basis_pct": to_float(metrics.get("basis_pct")),
+                "spot_taker_imbalance": to_float(metrics.get("spot_taker_imbalance")),
+                "spot_taker_notional": to_float(metrics.get("spot_taker_notional")),
+                "signal_state": component.get("signal_state"),
+                "overall_score": component.get("score"),
+                "capital_score": component.get("capital_score"),
+                "trigger_score": component.get("trigger_score"),
+                "quality_score": component.get("quality_score"),
+                "risk_score": component.get("risk_score"),
+                "short_squeeze": bool(component.get("short_squeeze")),
+                "market_rank_reference": getattr(row, "market_rank", None),
+                "marketcap_reference_usd": to_float(getattr(row, "marketcap_usd", None)),
+                "data_points": screen.get("data_points"),
+                "range_position_pct": screen.get("range_position_pct"),
+                "recent_range_position_pct": screen.get("recent_range_position_pct"),
+                "drawdown_from_high_pct": screen.get("drawdown_from_high_pct"),
+                "recent_low_extension_pct": screen.get("recent_low_extension_pct"),
+                "base_days": screen.get("base_days"),
+                "compression_ratio": screen.get("compression_ratio"),
+                "volume_ratio_7d": screen.get("volume_ratio_7d"),
+                "prior_test_pump_pct": screen.get("prior_test_pump_pct"),
+            }
+        )
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def load_structure_cache() -> dict[str, dict[str, Any]]:
+    if not STRUCTURE_CACHE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(STRUCTURE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, dict):
+        return {}
+    migrated: dict[str, dict[str, Any]] = {}
+    for symbol, value in entries.items():
+        screen = migrate_structure_screen(value.get("screen") or {})
+        if screen is None or "日線讀取失敗" in str(screen.get("reject_reason") or ""):
+            continue
+        migrated[symbol] = {"cached_at": value.get("cached_at", 0.0), "screen": screen}
+    return migrated
+
+
+def save_structure_cache() -> None:
+    cutoff = time.time() - max(structure_cache_seconds() * 4, 86400)
+    entries = {
+        symbol: value
+        for symbol, value in RUNTIME_STRUCTURE_CACHE.items()
+        if (
+            isinstance(value, dict)
+            and float(value.get("cached_at", 0.0)) >= cutoff
+            and (value.get("screen") or {}).get("model_version") == STRUCTURE_MODEL_VERSION
+        )
+    }
+    payload = {
+        "schema": "wgl-structure-cache-v3",
+        "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "entries": entries,
+    }
+    STRUCTURE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = STRUCTURE_CACHE_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(STRUCTURE_CACHE_PATH)
+
+
+def save_latest_wgl_report(report_text: str, candidates: list[dict[str, Any]], universe_size: int) -> None:
+    WGL_LATEST_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "wgl-latest-report-v3",
+        "generated_at": time.time(),
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "generated_local": time.strftime("%Y-%m-%d %H:%M"),
+        "universe_size": universe_size,
+        "symbols": [item.get("symbol") for item in candidates],
+        "report_text": report_text,
+    }
+    WGL_LATEST_REPORT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_cached_wgl_report() -> str:
+    if not WGL_LATEST_REPORT_PATH.exists():
+        return "資金雷達正在建立第一份全市場報告，完成後 /report 會立即顯示快取結果。"
+    try:
+        payload = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return "最近報告快取損壞，系統將在下一輪掃描重建。"
+    report = str(payload.get("report_text") or "目前沒有候選。")
+    generated_at = to_float(payload.get("generated_at"))
+    age_minutes = max(0, int((time.time() - generated_at) / 60)) if generated_at else None
+    age_text = f"{age_minutes} 分鐘前" if age_minutes is not None else "時間未知"
+    return f"{report}\n\n資料更新：{payload.get('generated_local', '-')}（{age_text}）"
+
+
+def initial_report_due_at(now: float | None = None) -> float:
+    current = time.time() if now is None else now
+    if not WGL_LATEST_REPORT_PATH.exists():
+        return current
+    try:
+        payload = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
+        generated_at = to_float(payload.get("generated_at"))
+    except (OSError, ValueError, TypeError):
+        return current
+    if generated_at is None or generated_at > current + 300:
+        return current
+    return max(current, generated_at + report_interval_seconds())
+
+
+def load_wgl_signal_states() -> dict[str, dict[str, Any]]:
+    if not WGL_SIGNAL_STATES_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(WGL_SIGNAL_STATES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    symbols = payload.get("symbols") if isinstance(payload, dict) else None
+    return symbols if isinstance(symbols, dict) else {}
+
+
+def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
+    states = load_wgl_signal_states()
+    transitions: list[dict[str, Any]] = []
+    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now_local = time.strftime("%Y-%m-%d %H:%M")
+    for item in candidates:
+        symbol = str(item.get("symbol") or "").upper()
+        state = str(item.get("signal_state") or "結構未成熟")
+        if not symbol:
+            continue
+        previous = states.get(symbol) or {}
+        previous_state = str(previous.get("state") or "")
+        record = {
+            "state": state,
+            "score": item.get("score"),
+            "structure_score": item.get("structure_score"),
+            "capital_score": item.get("capital_score"),
+            "trigger_score": item.get("trigger_score"),
+            "quality_score": item.get("quality_score"),
+            "risk_score": item.get("risk_score"),
+            "updated_utc": now_utc,
+            "updated_local": now_local,
+        }
+        states[symbol] = record
+        if previous_state != state:
+            transition = {
+                "timestamp_utc": now_utc,
+                "timestamp_local": now_local,
+                "symbol": symbol,
+                "from_state": previous_state or "未追蹤",
+                "to_state": state,
+                **record,
+            }
+            transitions.append(transition)
+            early_ready = bool(
+                previous_state
+                and state == "資金預備"
+                and int(record.get("structure_score") or 0) >= 65
+                and int(record.get("trigger_score") or 0) >= 35
+                and int(record.get("score") or 0) >= 55
+            )
+            if state in TRIGGER_STATES or early_ready:
+                guidance = (
+                    "早期資金共振，先列再確認；等待短線回踩守住，不能直接追價。"
+                    if early_ready
+                    else "只在回踩進場狀態視為可執行；點火確認仍需等回踩。"
+                )
+                alert = (
+                    f"狀態升級｜{symbol}\n"
+                    f"{transition['from_state']} → {state}\n"
+                    f"結構 {record['structure_score']}｜資金 {record['capital_score']}｜"
+                    f"觸發 {record['trigger_score']}｜資料 {record['quality_score']}｜風險 {record['risk_score']}\n"
+                    f"{guidance}"
+                )
+                with RUNTIME_TRANSITION_LOCK:
+                    RUNTIME_TRANSITION_ALERTS.append(alert)
+
+    payload = {
+        "schema": "wgl-signal-state-v3",
+        "updated_utc": now_utc,
+        "updated_local": now_local,
+        "symbols": states,
+    }
+    WGL_SIGNAL_STATES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WGL_SIGNAL_STATES_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if transitions:
+        WGL_TRANSITIONS_PATH.mkdir(parents=True, exist_ok=True)
+        path = WGL_TRANSITIONS_PATH / f"{time.strftime('%Y%m%d')}.jsonl"
+        with path.open("a", encoding="utf-8") as file:
+            for transition in transitions:
+                file.write(json.dumps(transition, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def consume_wgl_transition_alerts() -> list[str]:
+    with RUNTIME_TRANSITION_LOCK:
+        alerts = list(RUNTIME_TRANSITION_ALERTS)
+        RUNTIME_TRANSITION_ALERTS.clear()
+    return alerts
+
+
+def update_wgl_signal_outcomes(candidates: list[dict[str, Any]], current_rows: list[dict[str, Any]]) -> None:
+    payload: dict[str, Any] = {"schema": "wgl-signal-outcomes-v3", "signals": []}
+    if WGL_SIGNAL_OUTCOMES_PATH.exists():
+        try:
+            loaded = json.loads(WGL_SIGNAL_OUTCOMES_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("signals"), list):
+                payload = loaded
+        except Exception:
+            pass
+    signals = [item for item in payload.get("signals", []) if isinstance(item, dict)]
+    price_by_symbol = {
+        str(item["row"].symbol).upper(): to_float(getattr(item["row"], "mark_price", None))
+        for item in current_rows
+    }
+    now = time.time()
+    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    for signal in signals:
+        entry = to_float(signal.get("entry_price"))
+        price = price_by_symbol.get(str(signal.get("symbol") or "").upper())
+        if entry is None or price is None or entry <= 0:
+            continue
+        change = pct_change(price, entry)
+        signal["last_price"] = price
+        signal["last_return_pct"] = change
+        signal["last_updated_utc"] = now_utc
+        previous_mfe = to_float(signal.get("snapshot_mfe_pct"))
+        previous_mae = to_float(signal.get("snapshot_mae_pct"))
+        signal["snapshot_mfe_pct"] = max(previous_mfe if previous_mfe is not None else 0.0, change or 0.0)
+        signal["snapshot_mae_pct"] = min(previous_mae if previous_mae is not None else 0.0, change or 0.0)
+        if not signal.get("first_snapshot_hit"):
+            if change is not None and change >= strategy_take_profit_pct():
+                signal["first_snapshot_hit"] = "TP"
+                signal["first_snapshot_hit_utc"] = now_utc
+            elif change is not None and change <= -strategy_stop_loss_pct():
+                signal["first_snapshot_hit"] = "SL"
+                signal["first_snapshot_hit_utc"] = now_utc
+
+    day_key = local_day_key()
+    existing_keys = {
+        (str(item.get("symbol") or "").upper(), str(item.get("signal_state") or ""), str(item.get("entry_date") or ""))
+        for item in signals
+    }
+    for item in candidates:
+        state = str(item.get("signal_state") or "")
+        symbol = str(item.get("symbol") or "").upper()
+        if state not in TRIGGER_STATES or (symbol, state, day_key) in existing_keys:
+            continue
+        row = item.get("row")
+        entry = to_float(getattr(row, "mark_price", None))
+        if not symbol or entry is None:
+            continue
+        signals.append(
+            {
+                "id": f"{compact_day_key()}-{symbol}-{state}",
+                "symbol": symbol,
+                "signal_state": state,
+                "entry_date": day_key,
+                "entry_ts": now,
+                "entry_utc": now_utc,
+                "entry_price": entry,
+                "last_price": entry,
+                "last_return_pct": 0.0,
+                "snapshot_mfe_pct": 0.0,
+                "snapshot_mae_pct": 0.0,
+                "first_snapshot_hit": None,
+                "score": item.get("score"),
+                "structure_score": item.get("structure_score"),
+                "capital_score": item.get("capital_score"),
+                "trigger_score": item.get("trigger_score"),
+                "quality_score": item.get("quality_score"),
+                "risk_score": item.get("risk_score"),
+            }
+        )
+        existing_keys.add((symbol, state, day_key))
+
+    payload["updated_utc"] = now_utc
+    payload["signals"] = signals[-5000:]
+    WGL_SIGNAL_OUTCOMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WGL_SIGNAL_OUTCOMES_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def evaluate_signal_path_1m(signal: dict[str, Any], end_ts: float) -> dict[str, Any] | None:
+    symbol = str(signal.get("symbol") or "").upper()
+    entry = to_float(signal.get("entry_price"))
+    start_ts = to_float(signal.get("entry_ts"))
+    if not symbol or entry is None or entry <= 0 or start_ts is None or end_ts <= start_ts:
+        return None
+    start_ms = int(start_ts * 1000)
+    end_ms = int(end_ts * 1000)
+    rows: list[list[Any]] = []
+    cursor = start_ms
+    while cursor <= end_ms and len(rows) < 3000:
+        payload = binance_market_json(
+            "/fapi/v1/klines",
+            {
+                "symbol": symbol,
+                "interval": "1m",
+                "startTime": cursor,
+                "endTime": end_ms,
+                "limit": 1500,
+            },
+            timeout=20,
+        )
+        if not isinstance(payload, list) or not payload:
+            break
+        rows.extend(payload)
+        next_cursor = int(payload[-1][0]) + 60_000
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+    if not rows:
+        return None
+
+    tp_pct = strategy_take_profit_pct()
+    sl_pct = strategy_stop_loss_pct()
+    first_hit = None
+    first_hit_ts = None
+    highs = []
+    lows = []
+    for row in rows:
+        high = to_float(row[2])
+        low = to_float(row[3])
+        if high is None or low is None:
+            continue
+        highs.append(high)
+        lows.append(low)
+        up = pct_change(high, entry)
+        down = pct_change(low, entry)
+        if first_hit is None and up is not None and down is not None:
+            if up >= tp_pct and down <= -sl_pct:
+                first_hit = "同分鐘不確定"
+                first_hit_ts = int(row[0]) / 1000.0
+            elif up >= tp_pct:
+                first_hit = "TP"
+                first_hit_ts = int(row[0]) / 1000.0
+            elif down <= -sl_pct:
+                first_hit = "SL"
+                first_hit_ts = int(row[0]) / 1000.0
+    if not highs or not lows:
+        return None
+    final_price = to_float(rows[-1][4])
+    return {
+        "path_mfe_pct": pct_change(max(highs), entry),
+        "path_mae_pct": pct_change(min(lows), entry),
+        "path_last_return_pct": pct_change(final_price, entry),
+        "path_first_hit": first_hit,
+        "path_first_hit_utc": (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first_hit_ts)) if first_hit_ts else None
+        ),
+        "path_evaluated_until_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ts)),
+        "path_candle_count": len(rows),
+    }
 
 
 def wgl_seen_symbols_path() -> Path:
@@ -1292,6 +1768,15 @@ def migrate_legacy_wgl_seen_symbols() -> dict[str, dict[str, Any]]:
     return symbols
 
 
+def local_minute_to_utc(value: Any) -> str | None:
+    text = str(value or "").strip()
+    try:
+        parsed = time.strptime(text[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:00Z", time.gmtime(time.mktime(parsed)))
+
+
 def normalize_wgl_symbol_stats(symbols: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     start_date = wgl_stats_start_date()
     if not start_date:
@@ -1308,6 +1793,10 @@ def normalize_wgl_symbol_stats(symbols: dict[str, dict[str, Any]]) -> dict[str, 
                 continue
             day = dict(raw_day)
             day["date"] = day_key
+            if day.get("first_seen_local"):
+                day["first_seen_utc"] = local_minute_to_utc(day.get("first_seen_local")) or day.get("first_seen_utc")
+            if day.get("last_seen_local"):
+                day["last_seen_utc"] = local_minute_to_utc(day.get("last_seen_local")) or day.get("last_seen_utc")
             days[day_key] = day
         if not days:
             continue
@@ -1447,6 +1936,12 @@ def mark_wgl_report_seen(candidates: list[dict[str, Any]], seen: dict[str, dict[
                     "report_rank": item.get("report_rank"),
                     "symbol": symbol,
                     "score": score,
+                    "signal_state": item.get("signal_state"),
+                    "structure_score": item.get("structure_score"),
+                    "capital_score": item.get("capital_score"),
+                    "trigger_score": item.get("trigger_score"),
+                    "quality_score": item.get("quality_score"),
+                    "risk_score": item.get("risk_score"),
                     "wgl_score": item.get("wgl_score"),
                     "trade_bucket": item.get("trade_bucket"),
                     "trade_decision": item.get("trade_decision"),
@@ -1494,6 +1989,69 @@ def classify_spike_grade(
     if value_pct >= min_value_pct and contracts_pct >= min_contracts_pct:
         return "B"
     return "C"
+
+
+def classify_oi_trend_signal(
+    *,
+    contracts_1h_pct: float | None,
+    price_1h_pct: float | None,
+    oi_value_usd: float | None,
+    funding_rate_pct: float | None,
+    structure: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if (
+        contracts_1h_pct is None
+        or price_1h_pct is None
+        or oi_value_usd is None
+        or oi_value_usd < spike_min_value_usd()
+        or contracts_1h_pct <= 0
+        or price_1h_pct <= 0
+    ):
+        return None
+    if funding_rate_pct is not None and funding_rate_pct >= 0.10:
+        return None
+
+    screen = structure or {}
+    structure_score = float(screen.get("score") or 0)
+    base_days = int(screen.get("base_days") or 0)
+    recent_extension = to_float(screen.get("recent_low_extension_pct"))
+    bottom_structure = bool(
+        structure_score >= 60
+        and base_days >= 10
+        and recent_extension is not None
+        and recent_extension <= 80
+    )
+    bottom_trigger = bool(
+        bottom_structure
+        and contracts_1h_pct >= trend_min_contracts_pct()
+        and trend_min_price_pct() <= price_1h_pct <= trend_max_bottom_price_pct()
+    )
+    momentum_trigger = bool(
+        price_1h_pct <= trend_max_momentum_price_pct()
+        and (
+            (
+                contracts_1h_pct >= momentum_min_contracts_pct()
+                and price_1h_pct >= momentum_min_price_pct()
+            )
+            or (
+                contracts_1h_pct >= momentum_strong_contracts_pct()
+                and price_1h_pct >= momentum_strong_min_price_pct()
+            )
+        )
+    )
+    if not bottom_trigger and not momentum_trigger:
+        return None
+
+    short_squeeze = funding_rate_pct is not None and funding_rate_pct <= -0.10
+    if bottom_trigger:
+        signal_type = "軋空點火" if short_squeeze else "底部點火"
+        action = "再確認：等待 5-15 分鐘回踩守住，價/OI未轉弱再考慮"
+        lane = "bottom"
+    else:
+        signal_type = "軋空延續" if short_squeeze else "強勢延續"
+        action = "只列入動能觀察：不是底部埋伏，禁止直接追價"
+        lane = "momentum"
+    return {"signal_type": signal_type, "action": action, "lane": lane}
 
 
 def to_float(value: Any) -> float | None:
@@ -1836,6 +2394,11 @@ def kline_float(row: list[Any], idx: int) -> float | None:
     return to_float(row[idx])
 
 
+def closed_klines(rows: list[list[Any]]) -> list[list[Any]]:
+    now_ms = int(time.time() * 1000)
+    return [row for row in rows if len(row) > 6 and int(row[6]) <= now_ms]
+
+
 def daily_average(values: list[float | None]) -> float | None:
     clean = [value for value in values if value is not None]
     if not clean:
@@ -1853,23 +2416,14 @@ def daily_strategy_setup(
         return False, "symbol blocklist: not a long daily setup target", 0
 
     marketcap = watch.marketcap_usd if watch else None
-    if marketcap is None:
-        return False, "missing market cap", 0
-    if marketcap < strategy_min_marketcap_usd() or marketcap > strategy_max_marketcap_usd():
-        return False, f"market cap out of range: ${fmt_num(marketcap)}", 0
-
     oi_value = to_float(sample.get("oi_value_usd"))
-    oi_to_mcap = oi_value / marketcap * 100.0 if oi_value is not None and marketcap > 0 else None
-    if oi_to_mcap is None:
-        return False, "missing OI/market-cap ratio", 0
-    if oi_to_mcap < strategy_min_oi_to_mcap_pct() or oi_to_mcap > strategy_max_oi_to_mcap_pct():
-        return False, f"OI/market-cap out of range: {fmt_pct(oi_to_mcap)}", 0
+    oi_to_mcap = oi_value / marketcap * 100.0 if oi_value is not None and marketcap and marketcap > 0 else None
 
     funding = to_float(sample.get("funding_rate_pct"))
     if funding is None or abs(funding) > strategy_max_funding_pct():
         return False, f"funding too hot: {fmt_pct(funding, 4)}", 0
 
-    daily_klines = get_klines(symbol, interval="1d", limit=strategy_daily_lookback_days())
+    daily_klines = closed_klines(get_klines(symbol, interval="1d", limit=strategy_daily_lookback_days()))
     if len(daily_klines) < strategy_min_daily_candles():
         return False, f"not enough daily candles: {len(daily_klines)}", 0
 
@@ -1959,7 +2513,7 @@ def daily_strategy_setup(
     ):
         return False, f"daily OI not building: 1d {fmt_pct(oi_24h_pct)}, 2d {fmt_pct(oi_2d_pct)}", 0
 
-    four_h = get_klines(symbol, interval="4h", limit=180)
+    four_h = closed_klines(get_klines(symbol, interval="4h", limit=180))
     if len(four_h) < 60:
         return False, f"not enough 4h candles: {len(four_h)}", 0
     h4_closes = [kline_float(row, 4) for row in four_h]
@@ -2020,11 +2574,8 @@ def daily_strategy_setup(
         score += 6
     if h4_compressed:
         score += 6
-    if oi_to_mcap >= 4:
-        score += 5
-
     reason = (
-        f"日線長底部 | mcap ${fmt_num(marketcap)} | OI/MC {fmt_pct(oi_to_mcap)} | "
+        f"日線長底部 | 無市值限制 | "
         f"歷史區間 {range_multiple:.1f}x | 高點回撤{fmt_pct(drawdown_from_high)} | "
         f"低點+{fmt_pct(extension_from_low)} | 近低+{fmt_pct(recent_extension_from_low)} | 區間{fmt_pct(range_position)} | "
         f"P1d {fmt_pct(price_24h_pct)} | P3d {fmt_pct(price_3d_pct)} | "
@@ -2044,14 +2595,10 @@ def launch_structure_setup(
     symbol = str(symbol).upper()
     if symbol in strategy_blocklist():
         return None
-    if marketcap is None or marketcap < strategy_min_marketcap_usd() or marketcap > strategy_max_marketcap_usd():
-        return None
     if funding is None or abs(funding) > strategy_max_funding_pct():
         return None
-    if oi_to_mcap is None or oi_to_mcap < strategy_min_oi_to_mcap_pct() or oi_to_mcap > strategy_max_oi_to_mcap_pct():
-        return None
 
-    daily = get_klines(symbol, interval="1d", limit=strategy_daily_lookback_days())
+    daily = closed_klines(get_klines(symbol, interval="1d", limit=strategy_daily_lookback_days()))
     if len(daily) < strategy_min_daily_candles():
         return None
     closes = [kline_float(item, 4) for item in daily]
@@ -2135,7 +2682,7 @@ def launch_structure_setup(
     if (oi_24h_pct is None or oi_24h_pct < min_oi_24h) and (oi_2d_pct is None or oi_2d_pct < min_oi_2d):
         return None
 
-    four_h = get_klines(symbol, interval="4h", limit=180)
+    four_h = closed_klines(get_klines(symbol, interval="4h", limit=180))
     if len(four_h) < 60:
         return None
     h4_closes = [kline_float(row, 4) for row in four_h]
@@ -2216,8 +2763,6 @@ def launch_structure_setup(
         score += 5
     if h4_volume_ratio is not None and h4_volume_ratio >= 1.3:
         score += 8
-    if oi_to_mcap >= 4:
-        score += 6
     if abs(funding) <= 0.02:
         score += 4
 
@@ -2434,11 +2979,12 @@ def collect_strategy_alerts(
             onchain_signal = analyze_onchain(
                 symbol,
                 market_symbol=watch.market_symbol if watch else symbol.removesuffix("USDT"),
+                provider_id=watch.provider_id if watch else None,
             )
         except Exception as exc:
             print(f"Strategy on-chain filter error for {symbol}: {exc}", file=sys.stderr, flush=True)
             continue
-        if onchain_signal.score < strategy_onchain_min_score():
+        if onchain_signal.identity_verified and onchain_signal.score < strategy_onchain_min_score():
             now = time.time()
             if now - RUNTIME_ONCHAIN_OBSERVE_AT.get(symbol, 0.0) >= onchain_observe_cooldown_seconds():
                 reason_text = "\n".join(f"- {reason}" for reason in onchain_signal.reasons[:4])
@@ -2451,8 +2997,11 @@ def collect_strategy_alerts(
                 )
                 RUNTIME_ONCHAIN_OBSERVE_AT[symbol] = now
             continue
-        setup_score += max(0, min(onchain_signal.score, 10))
-        setup_reason = f"{setup_reason} | 鏈上{onchain_signal.verdict} {onchain_signal.score:+d}"
+        if onchain_signal.identity_verified:
+            setup_score += max(0, min(onchain_signal.score, 10))
+            setup_reason = f"{setup_reason} | 鏈上已驗證 {onchain_signal.verdict} {onchain_signal.score:+d}"
+        else:
+            setup_reason = f"{setup_reason} | 鏈上地址未驗證，不計分"
         if orderbook_enabled():
             try:
                 orderbook_signal = analyze_orderbook_accumulation(
@@ -2577,17 +3126,207 @@ def ranked_oi_candidates(
     for row in rows:
         remember_report_sample(history, row, now)
         metrics = report_metrics(row, history, now)
+        metrics["basis_pct"] = pct_change(
+            to_float(getattr(row, "mark_price", None)),
+            to_float(getattr(row, "price", None)),
+        )
         score = attention_score(row, metrics)
         out.append({"row": row, "metrics": metrics, "score": score})
     out.sort(
         key=lambda item: (
             item["score"],
-            item["metrics"]["oi_to_marketcap_pct"] or 0,
             item["row"].oi_value_usd or 0,
         ),
         reverse=True,
     )
-    return out[:limit]
+    return out if limit <= 0 else out[:limit]
+
+
+def active_history_symbols(
+    history: dict[str, deque[dict[str, Any]]],
+    *,
+    limit: int = 20,
+) -> list[str]:
+    active: list[tuple[float, str]] = []
+    for symbol, samples in list(history.items()):
+        rows = list(samples)
+        if len(rows) < 2:
+            continue
+        latest = rows[-1]
+        oldest = rows[0]
+        latest_oi = to_float(latest.get("open_interest"))
+        oldest_oi = to_float(oldest.get("open_interest"))
+        latest_price = to_float(latest.get("mark_price"))
+        oldest_price = to_float(oldest.get("mark_price"))
+        oi_change = abs(pct_change(latest_oi, oldest_oi) or 0.0)
+        price_change = abs(pct_change(latest_price, oldest_price) or 0.0)
+        activity = oi_change * 2.0 + price_change
+        if oi_change >= 1.0 or price_change >= 2.0:
+            active.append((activity, str(symbol).upper()))
+    active.sort(reverse=True)
+    return [symbol for _, symbol in active[:limit]]
+
+
+def select_deep_candidates(
+    candidates: list[dict[str, Any]],
+    active_symbols: set[str],
+    *,
+    limit: int,
+    momentum_quota: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    structure_ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item.get("prefilter_score") or 0,
+            (item.get("structure_screen") or {}).get("score") or 0,
+            item.get("live_momentum_score") or 0,
+        ),
+        reverse=True,
+    )
+    momentum_ranked = sorted(
+        (item for item in candidates if item["row"].symbol in active_symbols),
+        key=lambda item: (
+            item.get("momentum_rank_score") or 0,
+            item.get("live_momentum_score") or 0,
+            item.get("prefilter_score") or 0,
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    selected_symbols: set[str] = set()
+    for item in momentum_ranked[: min(limit, max(0, momentum_quota))]:
+        selected.append(item)
+        selected_symbols.add(item["row"].symbol)
+    for item in structure_ranked:
+        if item["row"].symbol in selected_symbols:
+            continue
+        selected.append(item)
+        selected_symbols.add(item["row"].symbol)
+        if len(selected) >= limit:
+            break
+    selected.sort(
+        key=lambda item: (
+            max(
+                item.get("prefilter_score") or 0,
+                (item.get("momentum_rank_score") or 0)
+                if item.get("selection_lane") == "momentum"
+                else 0,
+            ),
+            item.get("prefilter_score") or 0,
+            item.get("momentum_rank_score") or 0,
+        ),
+        reverse=True,
+    )
+    return selected[:limit]
+
+
+def structure_first_oi_candidates(
+    history: dict[str, deque[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not RUNTIME_STRUCTURE_CACHE:
+        RUNTIME_STRUCTURE_CACHE.update(load_structure_cache())
+    watches = resolve_watch_symbols()
+    shells = [{"row": watch, "metrics": {}, "score": 0} for watch in watches]
+    saved_states = load_wgl_signal_states()
+    active_symbols = active_history_symbols(history, limit=max(20, momentum_deep_quota() * 2))
+    active_symbol_set = set(active_symbols)
+    priority_symbols = structure_reference_symbols()
+    priority_symbols.update(active_symbol_set)
+    priority_symbols.update(
+        symbol
+        for symbol, state in saved_states.items()
+        if str(state.get("state") or "") in {"資金預備", *TRIGGER_STATES}
+    )
+    structured_universe = scan_structure_universe(
+        shells,
+        get_klines,
+        RUNTIME_STRUCTURE_CACHE,
+        cache_seconds=structure_cache_seconds(),
+        workers=structure_scan_workers(),
+        lookback_days=strategy_daily_lookback_days(),
+        min_candles=20,
+        max_refresh=structure_refresh_batch_size(),
+        priority_symbols=priority_symbols,
+    )
+    save_structure_cache()
+
+    watch_by_symbol = {watch.symbol: watch for watch in watches}
+    selected_watches: list[WatchSymbol] = []
+    seen: set[str] = set()
+    preselect_limit = max(onchain_report_candidate_count(), structure_scan_candidate_count())
+    for item in structured_universe[:preselect_limit]:
+        watch = item["row"]
+        if watch.symbol not in seen:
+            selected_watches.append(watch)
+            seen.add(watch.symbol)
+    for symbol in active_symbols:
+        watch = watch_by_symbol.get(symbol)
+        if watch and symbol not in seen:
+            selected_watches.append(watch)
+            seen.add(symbol)
+    for symbol, state in saved_states.items():
+        if str(state.get("state") or "") not in {"資金預備", *TRIGGER_STATES}:
+            continue
+        watch = watch_by_symbol.get(symbol)
+        if watch and symbol not in seen:
+            selected_watches.append(watch)
+            seen.add(symbol)
+
+    rows = [
+        row
+        for row in get_oi_snapshots(selected_watches, max_workers=oi_snapshot_workers())
+        if row.oi_value_usd is not None
+    ]
+    screen_by_symbol = {
+        item["row"].symbol: item.get("structure_screen") or {}
+        for item in structured_universe
+    }
+    now = time.time()
+    deep: list[dict[str, Any]] = []
+    for row in rows:
+        remember_report_sample(history, row, now)
+        metrics = report_metrics(row, history, now)
+        metrics["basis_pct"] = pct_change(
+            to_float(getattr(row, "mark_price", None)),
+            to_float(getattr(row, "price", None)),
+        )
+        momentum = live_momentum_score(row, metrics)
+        structure = screen_by_symbol.get(row.symbol) or {}
+        effective_structure = float(structure.get("score") or 0)
+        if not structure.get("eligible"):
+            effective_structure = min(effective_structure, 40.0)
+        oi_1h = max(0.0, to_float(metrics.get("contracts_1h_pct")) or 0.0)
+        price_1h = max(0.0, to_float(metrics.get("price_1h_pct")) or 0.0)
+        momentum_rank_score = min(
+            100.0,
+            max(
+                float(momentum),
+                oi_1h * 4.0 + price_1h * 3.0 + (20.0 if oi_1h > 0 and price_1h > 0 else 0.0),
+            ),
+        )
+        deep.append(
+            {
+                "row": row,
+                "metrics": metrics,
+                "score": attention_score(row, metrics),
+                "structure_screen": structure,
+                "live_momentum_score": momentum,
+                "momentum_rank_score": round(momentum_rank_score, 2),
+                "selection_lane": "momentum" if row.symbol in active_symbol_set else "structure",
+                "prefilter_score": round(effective_structure * 0.85 + momentum * 0.15, 2),
+            }
+        )
+
+    deep_limit = onchain_report_candidate_count()
+    selected = select_deep_candidates(
+        deep,
+        active_symbol_set,
+        limit=deep_limit,
+        momentum_quota=momentum_deep_quota(),
+    )
+    return structured_universe, selected
 
 
 def avg_clean(values: list[float | None]) -> float | None:
@@ -2647,6 +3386,49 @@ def binance_market_json(path: str, params: dict[str, Any], *, timeout: int = 10)
         raise ApiError(f"Binance HTTP {exc.code}: {body}") from exc
     except urllib.error.URLError as exc:
         raise ApiError(f"Binance network error: {exc}") from exc
+
+
+def get_spot_taker_flow(market_symbol: str) -> dict[str, Any] | None:
+    spot_symbol = f"{str(market_symbol).upper()}USDT"
+    now = time.time()
+    cached = RUNTIME_SPOT_FLOW_CACHE.get(spot_symbol)
+    if cached and now - float(cached.get("ts", 0.0)) < 300:
+        return dict(cached.get("flow") or {}) or None
+    query = urllib.parse.urlencode({"symbol": spot_symbol, "limit": 500})
+    request = urllib.request.Request(
+        f"https://api.binance.com/api/v3/aggTrades?{query}",
+        headers={"User-Agent": "oi-phase-spot-flow/1.0", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            trades = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        RUNTIME_SPOT_FLOW_CACHE[spot_symbol] = {"ts": now, "flow": {}}
+        return None
+    buy_notional = 0.0
+    sell_notional = 0.0
+    for trade in trades if isinstance(trades, list) else []:
+        price = to_float(trade.get("p"))
+        quantity = to_float(trade.get("q"))
+        if price is None or quantity is None:
+            continue
+        notional = price * quantity
+        if bool(trade.get("m")):
+            sell_notional += notional
+        else:
+            buy_notional += notional
+    total = buy_notional + sell_notional
+    if total <= 0:
+        return None
+    flow = {
+        "symbol": spot_symbol,
+        "taker_buy_notional": buy_notional,
+        "taker_sell_notional": sell_notional,
+        "taker_imbalance": (buy_notional - sell_notional) / total,
+        "sample_trades": len(trades),
+    }
+    RUNTIME_SPOT_FLOW_CACHE[spot_symbol] = {"ts": now, "flow": flow}
+    return flow
 
 
 def get_funding_history_pct(symbol: str, *, limit: int = 8) -> list[float]:
@@ -2758,18 +3540,12 @@ def ravelab_structure_candidate(row: Any, metrics: dict[str, float | None]) -> d
     symbol = str(row.symbol).upper()
     if symbol in strategy_blocklist():
         return None
-    if row.marketcap_usd is None or row.marketcap_usd < strategy_min_marketcap_usd():
-        return None
-    if row.marketcap_usd > strategy_max_marketcap_usd():
-        return None
     funding = to_float(row.funding_rate_pct)
     if funding is None or abs(funding) > strategy_max_funding_pct():
         return None
     oi_to_mcap = metrics.get("oi_to_marketcap_pct")
-    if oi_to_mcap is None or oi_to_mcap < strategy_min_oi_to_mcap_pct() or oi_to_mcap > strategy_max_oi_to_mcap_pct():
-        return None
 
-    daily = get_klines(symbol, interval="1d", limit=strategy_daily_lookback_days())
+    daily = closed_klines(get_klines(symbol, interval="1d", limit=strategy_daily_lookback_days()))
     if len(daily) < strategy_min_daily_candles():
         return None
     closes = [kline_float(item, 4) for item in daily]
@@ -2826,7 +3602,7 @@ def ravelab_structure_candidate(row: Any, metrics: dict[str, float | None]) -> d
     if daily_volume_ratio is not None and daily_volume_ratio > strategy_max_daily_volume_spike_ratio():
         return None
 
-    four_h = get_klines(symbol, interval="4h", limit=180)
+    four_h = closed_klines(get_klines(symbol, interval="4h", limit=180))
     if len(four_h) < 60:
         return None
     h4_closes = [kline_float(item, 4) for item in four_h]
@@ -2891,8 +3667,6 @@ def ravelab_structure_candidate(row: Any, metrics: dict[str, float | None]) -> d
         score += 3
     if h4_volume_ratio is not None and h4_volume_ratio >= 1.3:
         score += 8
-    if oi_to_mcap >= 4:
-        score += 6
     if abs(funding) <= 0.02:
         score += 4
 
@@ -3036,17 +3810,12 @@ def wgl_stage_candidate(
         and wgl_pullback_min_6h_range_position_pct() <= range_6h_position <= wgl_pullback_max_6h_range_position_pct()
     )
     pullback_funding_ok = current_funding is not None and abs(current_funding) <= wgl_pullback_max_funding_pct()
-    pullback_oi_mcap_ok = (
-        oi_to_mcap is not None
-        and wgl_pullback_min_oi_to_mcap_pct() <= oi_to_mcap <= strategy_max_oi_to_mcap_pct()
-    )
     pullback_oi_ok = oi_1h is None or oi_1h >= wgl_pullback_max_oi_1h_drop_pct()
     pullback_volume_ok = volume_ratio is None or volume_ratio >= wgl_pullback_min_volume_ratio()
     strong_pullback = bool(
         pullback_price_started
         and pullback_range_ok
         and pullback_funding_ok
-        and pullback_oi_mcap_ok
         and pullback_oi_ok
         and pullback_volume_ok
     )
@@ -3059,20 +3828,6 @@ def wgl_stage_candidate(
     score = 0.0
     reasons: list[str] = []
     risks: list[str] = []
-
-    if row.marketcap_usd is not None:
-        if row.marketcap_usd <= 50_000_000:
-            score += 6
-            reasons.append(f"小市值 ${fmt_num(row.marketcap_usd)}")
-        elif row.marketcap_usd > strategy_max_marketcap_usd():
-            score -= 8
-            risks.append(f"市值偏大 ${fmt_num(row.marketcap_usd)}")
-
-    if oi_to_mcap is not None and strategy_min_oi_to_mcap_pct() <= oi_to_mcap <= strategy_max_oi_to_mcap_pct():
-        score += 10
-        if oi_to_mcap >= 20:
-            score += 6
-        reasons.append(f"OI/市值 {fmt_pct(oi_to_mcap)}")
 
     if current_funding is not None:
         if abs(current_funding) <= strategy_max_funding_pct():
@@ -3108,7 +3863,7 @@ def wgl_stage_candidate(
         score += 30
         reasons.append(
             f"BLESS型回踩：24h {fmt_pct(price_24h)}、6H位階{fmt_pct(range_6h_position)}、"
-            f"OI/市值{fmt_pct(oi_to_mcap)}、funding {fmt_pct(current_funding, 4)}"
+            f"funding {fmt_pct(current_funding, 4)}"
         )
     elif pullback_price_started and pullback_range_ok:
         score += 8
@@ -3190,6 +3945,7 @@ def wgl_stage_candidate(
         "oi_6h_pct": oi_6h,
         "price_24h_pct": price_24h,
         "oi_24h_pct": oi_24h,
+        "volume_ratio": volume_ratio,
         "range_6h_position_pct": range_6h_position,
         "range_24h_position_pct": range_24h_position,
         "drawdown_from_24h_high_pct": drawdown_from_24h_high,
@@ -3199,7 +3955,7 @@ def wgl_stage_candidate(
     }
 
 
-def composite_candidate_rows(
+def legacy_composite_candidate_rows(
     ranked: list[dict[str, Any]],
     onchain_rows: list[dict[str, Any]],
     ravelab_rows: list[dict[str, Any]],
@@ -3275,11 +4031,7 @@ def composite_candidate_rows(
             elif onchain_signal.score < 0:
                 risks.append(f"鏈上{onchain_signal.verdict} {onchain_signal.score:+d}")
 
-        oi_to_mcap = metrics.get("oi_to_marketcap_pct")
         funding = to_float(row.funding_rate_pct)
-        if oi_to_mcap is not None and strategy_min_oi_to_mcap_pct() <= oi_to_mcap <= strategy_max_oi_to_mcap_pct():
-            score += 5
-            reasons.append(f"OI/市值 {fmt_pct(oi_to_mcap)}")
         if funding is not None and abs(funding) <= strategy_max_funding_pct():
             score += 3
         elif funding is not None:
@@ -3330,8 +4082,136 @@ def composite_candidate_rows(
             0 if data.get("wgl_action") == "不要進" else 1,
             data["score"],
             data.get("wgl_score") or 0,
-            data["metrics"].get("oi_to_marketcap_pct") or 0,
             data["row"].oi_value_usd or 0,
+        ),
+        reverse=True,
+    )
+    return output
+
+
+def composite_candidate_rows(
+    ranked: list[dict[str, Any]],
+    onchain_rows: list[dict[str, Any]],
+    ravelab_rows: list[dict[str, Any]],
+    launch_rows: list[dict[str, Any]],
+    orderbook_rows: list[dict[str, Any]],
+    wgl_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    onchain_by_symbol = {item["row"].symbol: item["signal"] for item in onchain_rows}
+    ravelab_by_symbol = {item["symbol"]: item for item in ravelab_rows}
+    launch_by_symbol = {item["symbol"]: item for item in launch_rows}
+    orderbook_by_symbol = {item["row"].symbol: item["signal"] for item in orderbook_rows}
+    wgl_by_symbol = {item["symbol"]: item for item in wgl_rows}
+
+    output: list[dict[str, Any]] = []
+    for source in ranked:
+        row = source["row"]
+        symbol = row.symbol
+        metrics = source.get("metrics") or {}
+        structure = source.get("structure_screen") or {}
+        onchain_signal = onchain_by_symbol.get(symbol)
+        bottom = ravelab_by_symbol.get(symbol)
+        launch = launch_by_symbol.get(symbol)
+        book = orderbook_by_symbol.get(symbol)
+        wgl = wgl_by_symbol.get(symbol)
+
+        components = v3_component_scores(
+            row=row,
+            metrics=metrics,
+            structure=structure,
+            wgl=wgl,
+            book=book,
+            bottom=bottom,
+            launch=launch,
+            onchain=onchain_signal,
+            orderbook_min_snapshots=orderbook_min_snapshots(),
+        )
+
+        labels = [components["signal_state"]]
+        reasons: list[str] = []
+        risks: list[str] = []
+        if components.get("short_squeeze"):
+            labels.append("軋空")
+            reasons.append(
+                f"負 Funding 軋空：{fmt_pct(to_float(getattr(row, 'funding_rate_pct', None)), 4)}，價/OI 1H 同步"
+            )
+        if structure.get("reasons"):
+            reasons.append("日線：" + "、".join(str(value) for value in structure["reasons"][:3]))
+        if wgl:
+            labels.append(str(wgl.get("stage") or "資金"))
+            wgl_reason = "；".join(str(value) for value in (wgl.get("reasons") or [])[:2])
+            if wgl_reason:
+                reasons.append(f"資金：{wgl_reason}")
+            risks.extend(str(value) for value in (wgl.get("risks") or [])[:2])
+        if bottom:
+            labels.append("底部")
+            reasons.append(f"底部{bottom['score']}分：{bottom['flags']}")
+        if launch:
+            labels.append("起漲")
+            reasons.append(f"起漲{launch['score']}分：{launch['flags']}")
+        if book:
+            if book.snapshot_count < orderbook_min_snapshots():
+                risks.append(f"訂單簿快照不足 {book.snapshot_count}/{orderbook_min_snapshots()}")
+            elif book.score >= orderbook_min_score():
+                labels.append("吸籌")
+                first_reason = book.reasons[0] if book.reasons else f"{book.verdict}{book.score}分"
+                reasons.append(f"訂單簿{book.score}分：{first_reason}")
+            elif book.verdict == "偏弱/派發":
+                risks.append(f"訂單簿偏弱：{book.score}分")
+        if onchain_signal:
+            if getattr(onchain_signal, "identity_verified", False):
+                reasons.append(f"鏈上已驗證：{onchain_signal.verdict} {onchain_signal.score:+d}")
+            else:
+                reasons.append(
+                    f"DEX參考：{onchain_signal.verdict} {onchain_signal.score:+d}（地址未驗證，不計分）"
+                )
+        if components.get("spot_taker_imbalance") is not None:
+            reasons.append(f"現貨主動成交 {fmt_pct(float(components['spot_taker_imbalance']) * 100)}")
+        if components.get("basis_pct") is not None:
+            reasons.append(f"合約基差 {fmt_pct(components.get('basis_pct'), 4)}")
+
+        funding = to_float(getattr(row, "funding_rate_pct", None))
+        if funding is not None and abs(funding) > strategy_max_funding_pct():
+            risks.append(f"Funding {fmt_pct(funding, 4)}")
+        if risks:
+            deduped_risks: list[str] = []
+            for risk in risks:
+                if risk not in deduped_risks:
+                    deduped_risks.append(risk)
+            reasons.append("風險：" + "；".join(deduped_risks[:2]))
+        if not reasons:
+            reasons.append("結構已進入候選，但資金與觸發仍不足")
+
+        deduped_reasons: list[str] = []
+        for reason in reasons:
+            if reason not in deduped_reasons:
+                deduped_reasons.append(reason)
+
+        output.append(
+            {
+                "symbol": symbol,
+                "score": components["overall_score"],
+                **components,
+                "labels": "、".join(dict.fromkeys(labels)),
+                "reasons": deduped_reasons[:4],
+                "row": row,
+                "metrics": metrics,
+                "structure_screen": structure,
+                "wgl": wgl,
+                "book": book,
+                "wgl_score": int(wgl.get("score") or 0) if wgl else 0,
+                "wgl_action": str(wgl.get("action") or "") if wgl else "",
+            }
+        )
+
+    output.sort(
+        key=lambda data: (
+            data.get("state_priority") or 0,
+            data["score"],
+            data.get("structure_score") or 0,
+            data.get("trigger_score") or 0,
+            data.get("quality_score") or 0,
+            getattr(data["row"], "oi_value_usd", None) or 0,
         ),
         reverse=True,
     )
@@ -3364,91 +4244,49 @@ def classify_wgl_trade_item(
 ) -> dict[str, Any]:
     symbol = str(item.get("symbol") or "").upper()
     first_seen = seen.get(symbol) or {}
-
-    row = item.get("row")
-    wgl = item.get("wgl") or {}
-    metrics = item.get("metrics") or {}
+    state = str(item.get("signal_state") or "結構未成熟")
     score = int(item.get("score") or 0)
-    stage_text = " ".join(
-        str(value)
-        for value in [
-            item.get("labels"),
-            wgl.get("stage"),
-            wgl.get("action"),
-        ]
-        if value
-    )
-    risk_parts = [str(risk) for risk in wgl.get("risks") or []]
-    risk_parts.extend(str(reason) for reason in item.get("reasons") or [] if str(reason).startswith("風險"))
-    risk_text = "；".join(risk_parts)
-    funding = to_float(getattr(row, "funding_rate_pct", None))
-    hard_risk = (
-        str(wgl.get("action") or "") == "不要進"
-        or any(keyword in risk_text for keyword in ["派發", "偏熱", "OI 1H轉負", "疑似空方", "偏伸"])
-        or (funding is not None and funding >= 0.10)
-    )
-    if hard_risk:
+    quality = int(item.get("quality_score") or 0)
+    risk = int(item.get("risk_score") or 0)
+    notice_label = "再次出現" if first_seen else "首次通知"
+
+    if state == "失效/派發" or risk >= 45:
         return {
             "trade_bucket": "blocked",
             "trade_decision": "不要進",
-            "trade_setup": "風險過高",
-            "trade_reason": short_text(risk_text or "出現派發/過熱/OI轉弱風險"),
+            "trade_setup": "失效/派發",
+            "trade_reason": f"風險 {risk}/100，等待重新形成底部",
             "first_seen": first_seen or None,
         }
-
-    is_pullback_setup = "強勢回踩" in stage_text
-    is_structure_setup = any(keyword in stage_text for keyword in ["底部", "起漲", "強勢回踩"])
-    wgl_score = int(wgl.get("score") or 0)
-    notice_label = "再次出現" if first_seen else "首次通知"
-    if report_rank <= wgl_open_max_rank() and is_pullback_setup and wgl_score >= wgl_pullback_min_score():
+    if state == "回踩進場" and quality >= 50 and score >= 50:
         return {
             "trade_bucket": "open",
             "trade_decision": "可開單",
-            "trade_setup": "A2回踩",
-            "trade_reason": f"{notice_label}｜排名{report_rank}｜WGL{wgl_score}分｜{first_signal_reason(item)}",
+            "trade_setup": "回踩確認",
+            "trade_reason": f"{notice_label}｜結構與觸發通過｜{first_signal_reason(item)}",
             "first_seen": first_seen or None,
         }
-    if report_rank <= wgl_open_max_rank() and score >= wgl_open_min_score() and is_structure_setup:
-        return {
-            "trade_bucket": "open",
-            "trade_decision": "可開單",
-            "trade_setup": "A2回踩" if is_pullback_setup else "A結構",
-            "trade_reason": f"{notice_label}｜排名{report_rank}｜分數{score}｜{first_signal_reason(item)}",
-            "first_seen": first_seen or None,
-        }
-
-    price_1h = to_float(wgl.get("price_1h_pct"))
-    if price_1h is None:
-        price_1h = to_float(metrics.get("price_1h_pct"))
-    oi_1h = to_float(wgl.get("oi_1h_pct"))
-    if oi_1h is None:
-        oi_1h = to_float(metrics.get("contracts_1h_pct"))
-    price_oi_sync = price_1h is not None and oi_1h is not None and price_1h > 0 and oi_1h > 0
-    ignition_like = (
-        "軋空" in stage_text
-        or "起漲確認" in stage_text
-        or str(wgl.get("action") or "") == "再確認偏強"
-        or price_oi_sync
-    )
-    if score >= wgl_ignition_min_score() and ignition_like:
+    if state == "點火確認":
         return {
             "trade_bucket": "confirm",
             "trade_decision": "待確認",
-            "trade_setup": "B點火",
-            "trade_reason": "等5-15分鐘：突破警報高點且價/OI續增才開",
+            "trade_setup": "點火確認",
+            "trade_reason": "已點火但不追價，等待4H/短線回踩守住突破位",
             "first_seen": first_seen or None,
         }
-
-    if report_rank > wgl_open_max_rank():
-        reason = f"排名{report_rank}超過開單區，只觀察"
-    elif score < wgl_open_min_score():
-        reason = f"分數{score}低於可開門檻{wgl_open_min_score()}"
-    else:
-        reason = "條件未完整，等下一次確認"
+    if state == "資金預備":
+        return {
+            "trade_bucket": "confirm",
+            "trade_decision": "待確認",
+            "trade_setup": "資金預備",
+            "trade_reason": "底部資金開始累積，等價/OI點火或回踩確認",
+            "first_seen": first_seen or None,
+        }
+    reason = "日線仍在底部建立中" if state == "底部觀察" else "結構尚未完整"
     return {
         "trade_bucket": "observe",
         "trade_decision": "觀察",
-        "trade_setup": "雷達",
+        "trade_setup": state,
         "trade_reason": reason,
         "first_seen": first_seen or None,
     }
@@ -3487,14 +4325,14 @@ def wgl_card_grade(score: int) -> str:
 
 
 def wgl_card_risk(item: dict[str, Any]) -> str:
-    row = item.get("row")
-    funding = to_float(getattr(row, "funding_rate_pct", None))
-    bucket = str(item.get("trade_bucket") or "")
-    if bucket == "blocked" or (funding is not None and funding >= 0.10):
+    risk = int(item.get("risk_score") or 0)
+    if risk >= 60:
         return "極高"
-    if bucket in {"open", "confirm"} or int(item.get("score") or 0) >= 75:
+    if risk >= 35:
         return "高"
-    return "中"
+    if risk >= 15:
+        return "中"
+    return "低"
 
 
 def wgl_card_mode(item: dict[str, Any]) -> str:
@@ -3502,10 +4340,10 @@ def wgl_card_mode(item: dict[str, Any]) -> str:
     if bucket == "blocked":
         return "不要進"
     if bucket == "confirm":
-        return "做多待確認"
+        return "再確認"
     if bucket == "observe":
-        return "做多觀察"
-    return "做多"
+        return "觀察"
+    return "可分批做多"
 
 
 def wgl_card_seen_state(item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -3541,7 +4379,6 @@ def wgl_card_signal_counts(item: dict[str, Any]) -> tuple[int, int]:
     oi_180s = to_float(metrics.get("contracts_180s_pct"))
     price_24h = to_float(wgl.get("price_24h_pct"))
     oi_24h = to_float(wgl.get("oi_24h_pct"))
-    oi_to_mcap = to_float(metrics.get("oi_to_marketcap_pct"))
 
     short_count = sum(
         1
@@ -3559,7 +4396,6 @@ def wgl_card_signal_counts(item: dict[str, Any]) -> tuple[int, int]:
         for ok in [
             price_24h is not None and price_24h > 0,
             oi_24h is not None and oi_24h > 0,
-            oi_to_mcap is not None and oi_to_mcap >= wgl_pullback_min_oi_to_mcap_pct(),
             bool(wgl.get("strong_pullback")),
             any(key in str(item.get("labels") or "") for key in ["底部", "起漲", "強勢回踩"]),
         ]
@@ -3569,37 +4405,21 @@ def wgl_card_signal_counts(item: dict[str, Any]) -> tuple[int, int]:
 
 
 def wgl_card_reasons(item: dict[str, Any]) -> str:
-    metrics = item.get("metrics") or {}
-    wgl = item.get("wgl") or {}
-    tags: list[str] = []
-    setup = str(item.get("trade_setup") or "")
-    score = int(item.get("score") or 0)
-    wgl_score = int(item.get("wgl_score") or wgl.get("score") or 0)
-    price_1h = to_float(wgl.get("price_1h_pct")) or to_float(metrics.get("price_1h_pct"))
-    oi_1h = to_float(wgl.get("oi_1h_pct")) or to_float(metrics.get("contracts_1h_pct"))
+    reasons = [short_text(str(value), 42) for value in (item.get("reasons") or []) if value]
+    return " / ".join(reasons[:3]) or "等待更多資料"
 
-    if setup:
-        tags.append(setup)
-    if score >= 100:
-        tags.append("100分以上")
-    if score >= wgl_open_min_score():
-        tags.append("資金分達標")
-    if wgl_score >= wgl_min_score():
-        tags.append("WGL達標")
-    if wgl.get("strong_pullback"):
-        tags.append("強勢回踩")
-    if price_1h is not None and oi_1h is not None and price_1h > 0 and oi_1h > 0:
-        tags.append("1H動能達標")
-        if price_1h >= 2 and oi_1h >= 2:
-            tags.append("1H強爆發")
-    tags.append(first_signal_reason(item))
 
-    output: list[str] = []
-    for tag in tags:
-        clean = short_text(str(tag), 34)
-        if clean and clean not in output:
-            output.append(clean)
-    return " / ".join(output)
+def wgl_entry_condition(item: dict[str, Any]) -> str:
+    state = str(item.get("signal_state") or "")
+    if state == "回踩進場":
+        return "回踩守穩，可分批；禁止追離結構位過遠"
+    if state == "點火確認":
+        return "等回踩突破位，價/OI再次同步才進"
+    if state == "資金預備":
+        return "等4H點火或價/OI同步，不先猜突破"
+    if state == "底部觀察":
+        return "只觀察，尚未形成資金與觸發共振"
+    return "目前不進場"
 
 
 def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> str:
@@ -3608,14 +4428,12 @@ def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, di
     wgl = item.get("wgl") or {}
     state = wgl_card_seen_state(item, seen)
     score = int(item.get("score") or 0)
-    wgl_score = int(item.get("wgl_score") or wgl.get("score") or score)
     grade = wgl_card_grade(score)
     first_price = to_float(state.get("first_price"))
     current_price = to_float(state.get("current_price"))
     move_pct = pct_change(current_price, first_price)
     up_pct = max(move_pct or 0.0, 0.0)
     down_pct = max(-(move_pct or 0.0), 0.0)
-    sentiment = max(0.0, min(100.0, float(score)))
     marketcap = to_float(getattr(row, "marketcap_usd", None))
     short_count, trend_count = wgl_card_signal_counts(item)
 
@@ -3624,12 +4442,18 @@ def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, di
             "🟡 資金異動",
             "",
             f"幣種：{item['symbol']}",
-            f"分數：{score}/100",
-            f"品質：{grade}",
-            f"風險：{wgl_card_risk(item)}",
-            f"模式：{wgl_card_mode(item)}",
-            f"妖幣欄位：{grade}妖幣快打 | 分數 {wgl_score} | 第 {state['push_count']} 次",
-            f"妖幣原因：{wgl_card_reasons(item)}",
+            f"階段：{item.get('signal_state', '-')}",
+            f"決策：{wgl_card_mode(item)}",
+            f"總分：{score}/100｜品質：{grade}｜風險：{wgl_card_risk(item)}",
+            (
+                f"結構：{item.get('structure_score', 0)}｜資金：{item.get('capital_score', 0)}｜"
+                f"觸發：{item.get('trigger_score', 0)}｜資料：{item.get('quality_score', 0)}｜"
+                f"風險分：{item.get('risk_score', 0)}"
+            ),
+            f"出現次數：第 {state['push_count']} 次",
+            f"理由：{wgl_card_reasons(item)}",
+            f"進場條件：{wgl_entry_condition(item)}",
+            "失效條件：Funding過熱／OI增價跌／訂單簿派發／跌破底部結構",
             f"#：{index}",
             f"首次推送：{state['first_time']}",
             f"首訊方向：{state['direction']}",
@@ -3638,9 +4462,8 @@ def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, di
             f"當前幣價($)：{fmt_num(current_price, 6)}",
             f"推送後漲幅：{up_pct:.2f}%",
             f"推送後跌幅：{down_pct:.2f}%",
-            f"看漲情緒：{sentiment:.2f}%",
-            "全部：合約",
-            f"市值：{'-' if marketcap is None else '$' + fmt_num(marketcap)}",
+            "市值條件：無",
+            f"市值參考：{'-' if marketcap is None else '$' + fmt_num(marketcap)}（不計分）",
             f"短線異動：{short_count}",
             f"趨勢異動：{trend_count}",
         ]
@@ -3693,6 +4516,8 @@ def build_wgl_daily_summary(day_key: str | None = None) -> str:
             continue
         first_price = to_float(day.get("first_price")) or to_float(record.get("first_price"))
         last_price = to_float(day.get("last_price")) or to_float(record.get("last_price"))
+        max_price = to_float(day.get("max_price")) or last_price
+        min_price = to_float(day.get("min_price")) or last_price
         items.append(
             {
                 "symbol": symbol,
@@ -3702,6 +4527,8 @@ def build_wgl_daily_summary(day_key: str | None = None) -> str:
                 "first_price": first_price,
                 "last_price": last_price,
                 "change_pct": pct_change(last_price, first_price),
+                "snapshot_mfe_pct": pct_change(max_price, first_price),
+                "snapshot_mae_pct": pct_change(min_price, first_price),
                 "best_score": int(to_float(day.get("best_score")) or to_float(day.get("last_score")) or 0),
                 "worst_score": int(to_float(day.get("worst_score")) or to_float(day.get("last_score")) or 0),
                 "last_score": int(to_float(day.get("last_score")) or 0),
@@ -3722,12 +4549,56 @@ def build_wgl_daily_summary(day_key: str | None = None) -> str:
 
     summary_path = wgl_daily_summary_path(day_key)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
+    outcome_payload: dict[str, Any] = {"schema": "wgl-signal-outcomes-v3", "signals": []}
+    outcome_signals: list[dict[str, Any]] = []
+    if WGL_SIGNAL_OUTCOMES_PATH.exists():
+        try:
+            outcome_payload = json.loads(WGL_SIGNAL_OUTCOMES_PATH.read_text(encoding="utf-8"))
+            outcome_signals = [
+                signal
+                for signal in outcome_payload.get("signals", [])
+                if isinstance(signal, dict) and signal.get("entry_date") == day_key
+            ]
+        except Exception:
+            outcome_signals = []
+    try:
+        day_end_ts = time.mktime(time.strptime(f"{day_key} 23:59:59", "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        day_end_ts = time.time()
+    evaluated_until = min(time.time(), day_end_ts)
+    for signal in outcome_signals:
+        try:
+            exact = evaluate_signal_path_1m(signal, evaluated_until)
+        except Exception as exc:
+            signal["path_error"] = str(exc)
+            continue
+        if exact:
+            signal.update(exact)
+    if outcome_signals:
+        outcome_payload["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        WGL_SIGNAL_OUTCOMES_PATH.write_text(
+            json.dumps(outcome_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    tp_count = sum(1 for signal in outcome_signals if signal.get("path_first_hit") == "TP")
+    sl_count = sum(1 for signal in outcome_signals if signal.get("path_first_hit") == "SL")
+    ambiguous_count = sum(1 for signal in outcome_signals if signal.get("path_first_hit") == "同分鐘不確定")
+    open_count = sum(1 for signal in outcome_signals if not signal.get("path_first_hit"))
+
     payload = {
         "date": day_key,
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "generated_local": time.strftime("%Y-%m-%d %H:%M"),
         "symbol_count": len(items),
         "total_appearances": sum(item["push_count"] for item in items),
+        "signal_outcomes": {
+            "signals": len(outcome_signals),
+            "tp_first": tp_count,
+            "sl_first": sl_count,
+            "ambiguous": ambiguous_count,
+            "unresolved": open_count,
+            "note": "TP/SL first hit、MFE、MAE 使用 Binance 1m K 線；同分鐘雙觸發不猜順序。",
+        },
         "items": items,
     }
     summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3736,7 +4607,9 @@ def build_wgl_daily_summary(day_key: str | None = None) -> str:
     lines = [
         f"每日資金異動統計｜{day_label}",
         f"出現標的：{len(items)}｜總出現次數：{payload['total_appearances']}",
-        "規則：重複標的保留，只統計當天強弱變化。",
+        f"觸發訊號：{len(outcome_signals)}｜TP先到 {tp_count}｜SL先到 {sl_count}｜"
+        f"同分鐘不確定 {ambiguous_count}｜未結束 {open_count}",
+        "規則：重複標的保留；TP/SL 與 MFE/MAE 使用 1m K 線，不猜同分鐘內先後。",
     ]
     if not items:
         lines.append("今日尚未記錄到 WGL TOP 標的。")
@@ -3746,7 +4619,8 @@ def build_wgl_daily_summary(day_key: str | None = None) -> str:
                 f"{idx}. {item['symbol']}｜出現 {item['push_count']} 次｜"
                 f"{wgl_summary_time(item.get('first_seen_local'))}-{wgl_summary_time(item.get('last_seen_local'))}｜"
                 f"最佳{item['best_score']}分｜最後{item['last_trade_decision']}/{item['last_trade_setup']}｜"
-                f"漲跌 {fmt_pct(item['change_pct'])}"
+                f"漲跌 {fmt_pct(item['change_pct'])}｜MFE {fmt_pct(item['snapshot_mfe_pct'])}｜"
+                f"MAE {fmt_pct(item['snapshot_mae_pct'])}"
             )
     lines.append(f"已存檔：{summary_path}")
     return "\n".join(lines)
@@ -3766,6 +4640,22 @@ def orderbook_collection_symbols(history: dict[str, deque[dict[str, Any]]] | Non
 
     selected: list[str] = []
     seen: set[str] = set()
+    if WGL_LATEST_REPORT_PATH.exists():
+        try:
+            latest_report = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
+            report_symbols = latest_report.get("symbols") or []
+            if isinstance(report_symbols, list):
+                for raw_symbol in report_symbols:
+                    symbol = normalize_symbol(str(raw_symbol or ""))
+                    if not symbol or symbol in seen:
+                        continue
+                    selected.append(symbol)
+                    seen.add(symbol)
+                    if len(selected) >= limit:
+                        return selected
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"Orderbook latest report read error: {exc}", file=sys.stderr, flush=True)
+
     for _, symbol in ranked_history:
         if symbol and symbol not in seen:
             selected.append(symbol)
@@ -3793,16 +4683,17 @@ def collect_orderbook_cycle(history: dict[str, deque[dict[str, Any]]] | None = N
     symbols = orderbook_collection_symbols(history)
     if not symbols:
         return 0, 0
-    snapshots, errors = collect_orderbook_snapshots(
-        symbols,
-        orderbook_db_path(),
-        max_workers=orderbook_workers(),
-        limit=50,
-    )
-    try:
-        prune_orderbook_db(orderbook_db_path(), keep_days=orderbook_prune_days())
-    except Exception as exc:
-        print(f"Orderbook prune error: {exc}", file=sys.stderr, flush=True)
+    with RUNTIME_ORDERBOOK_LOCK:
+        snapshots, errors = collect_orderbook_snapshots(
+            symbols,
+            orderbook_db_path(),
+            max_workers=orderbook_workers(),
+            limit=50,
+        )
+        try:
+            prune_orderbook_db(orderbook_db_path(), keep_days=orderbook_prune_days())
+        except Exception as exc:
+            print(f"Orderbook prune error: {exc}", file=sys.stderr, flush=True)
     if errors and len(errors) >= len(symbols):
         first_symbol, first_error = next(iter(errors.items()))
         print(f"Orderbook collect failed for all symbols, first {first_symbol}: {first_error}", file=sys.stderr, flush=True)
@@ -3823,19 +4714,20 @@ def seed_orderbook_symbol(symbol: str) -> None:
         print(f"Orderbook seed error for {symbol}: {exc}", file=sys.stderr, flush=True)
 
 
-def build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]] | None = None) -> str:
+def legacy_build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]] | None = None) -> str:
     history = history or RUNTIME_SPIKE_HISTORY
     ranked = ranked_oi_candidates(history, limit=onchain_report_candidate_count())
     if not ranked:
         return "每小時鏈上雷達｜目前沒有可查 OI 標的。"
     if orderbook_enabled():
         try:
-            collect_orderbook_snapshots(
-                [item["row"].symbol for item in ranked[:orderbook_watch_candidates()]],
-                orderbook_db_path(),
-                max_workers=orderbook_workers(),
-                limit=50,
-            )
+            with RUNTIME_ORDERBOOK_LOCK:
+                collect_orderbook_snapshots(
+                    [item["row"].symbol for item in ranked[:orderbook_report_seed_candidates()]],
+                    orderbook_db_path(),
+                    max_workers=orderbook_workers(),
+                    limit=50,
+                )
         except Exception as exc:
             print(f"Hourly orderbook seed error: {exc}", file=sys.stderr, flush=True)
 
@@ -3969,6 +4861,159 @@ def build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]] | None
     return report_text
 
 
+def build_onchain_hourly_report(
+    history: dict[str, deque[dict[str, Any]]] | None = None,
+    *,
+    persist: bool = True,
+) -> str:
+    history = history or RUNTIME_SPIKE_HISTORY
+    structured, ranked = structure_first_oi_candidates(history)
+    if not structured or not ranked:
+        return "每小時資金雷達｜目前沒有可查 OI 標的。"
+    selected_symbols = {item["row"].symbol for item in ranked}
+
+    if orderbook_enabled():
+        try:
+            with RUNTIME_ORDERBOOK_LOCK:
+                collect_orderbook_snapshots(
+                    [item["row"].symbol for item in ranked[:orderbook_report_seed_candidates()]],
+                    orderbook_db_path(),
+                    max_workers=orderbook_workers(),
+                    limit=50,
+                )
+        except Exception as exc:
+            print(f"Hourly orderbook seed error: {exc}", file=sys.stderr, flush=True)
+
+    onchain_rows: list[dict[str, Any]] = []
+    ravelab_rows: list[dict[str, Any]] = []
+    launch_rows: list[dict[str, Any]] = []
+    orderbook_rows: list[dict[str, Any]] = []
+    wgl_rows: list[dict[str, Any]] = []
+    structure_limit = min(len(ranked), structure_scan_candidate_count())
+    wgl_limit = min(len(ranked), wgl_scan_candidate_count())
+    onchain_limit = min(len(ranked), onchain_deep_candidate_count())
+    spot_flow_limit = min(len(ranked), spot_flow_candidate_count())
+
+    for index, item in enumerate(ranked):
+        row = item["row"]
+        watch_symbol = row.market_symbol or row.symbol.removesuffix("USDT")
+        setup = None
+        launch_setup = None
+        book_signal = None
+
+        if index < spot_flow_limit:
+            spot_flow = get_spot_taker_flow(watch_symbol)
+            if spot_flow:
+                item["metrics"]["spot_taker_imbalance"] = spot_flow.get("taker_imbalance")
+                item["metrics"]["spot_taker_notional"] = (
+                    to_float(spot_flow.get("taker_buy_notional")) or 0
+                ) + (to_float(spot_flow.get("taker_sell_notional")) or 0)
+
+        if index < onchain_limit:
+            try:
+                signal = analyze_onchain(
+                    row.symbol,
+                    market_symbol=watch_symbol,
+                    provider_id=getattr(row, "provider_id", None),
+                )
+            except Exception as exc:
+                print(f"Hourly on-chain scan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+                signal = None
+            if signal is not None:
+                onchain_rows.append({"row": row, "metrics": item["metrics"], "signal": signal})
+
+        if index < structure_limit:
+            try:
+                setup = ravelab_structure_candidate(row, item["metrics"])
+            except Exception as exc:
+                print(f"RAVE/LAB structure scan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+            if setup is not None:
+                ravelab_rows.append(setup)
+            try:
+                launch_setup = launch_structure_candidate(row, item["metrics"])
+            except Exception as exc:
+                print(f"Launch structure scan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+            if launch_setup is not None:
+                launch_rows.append(launch_setup)
+
+        if orderbook_enabled():
+            try:
+                book_signal = analyze_orderbook_accumulation(
+                    row.symbol,
+                    orderbook_db_path(),
+                    lookback_seconds=orderbook_lookback_seconds(),
+                    min_snapshots=orderbook_min_snapshots(),
+                )
+            except Exception as exc:
+                print(f"Orderbook accumulation scan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+            if book_signal is not None:
+                orderbook_rows.append({"row": row, "signal": book_signal})
+
+        if index < wgl_limit:
+            try:
+                wgl_setup = wgl_stage_candidate(row, item["metrics"], book_signal, setup, launch_setup)
+            except Exception as exc:
+                print(f"WGL stage scan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+                wgl_setup = None
+            if wgl_setup is not None:
+                wgl_rows.append(wgl_setup)
+
+    composite_rows = composite_candidate_rows(
+        ranked,
+        onchain_rows,
+        ravelab_rows,
+        launch_rows,
+        orderbook_rows,
+        wgl_rows,
+    )
+    if persist:
+        save_wgl_full_scan_event(structured, selected_symbols, ranked, composite_rows)
+        update_wgl_signal_states(composite_rows)
+
+    seen_symbols = load_wgl_seen_symbols()
+    report_rows: list[dict[str, Any]] = []
+    for idx, raw_item in enumerate(composite_rows[:composite_report_top_n()], 1):
+        item = dict(raw_item)
+        item["report_rank"] = idx
+        item.update(classify_wgl_trade_item(item, idx, seen_symbols))
+        report_rows.append(item)
+
+    open_rows = [item for item in report_rows if item.get("trade_bucket") == "open"]
+    confirm_rows = [item for item in report_rows if item.get("trade_bucket") == "confirm"]
+    blocked_rows = [item for item in report_rows if item.get("trade_bucket") == "blocked"]
+    eligible_count = sum(1 for item in structured if (item.get("structure_screen") or {}).get("eligible"))
+    structure_covered = sum(
+        1 for item in structured if int((item.get("structure_screen") or {}).get("data_points") or 0) > 0
+    )
+
+    lines: list[str] = []
+    if report_rows:
+        for idx, item in enumerate(report_rows, 1):
+            if idx > 1:
+                lines.extend(["", "-----", ""])
+            lines.append(format_wgl_funding_card(idx, item, seen_symbols))
+    else:
+        lines.extend(["🟡 資金異動", "", "目前沒有足夠明確的 TOP 5 候選。"])
+
+    lines.append("")
+    lines.append(
+        "摘要："
+        f"全市場 {len(structured)}｜結構已掃 {structure_covered}｜待補 {len(structured) - structure_covered}｜"
+        f"底部候選 {eligible_count}｜深度分析 {len(ranked)}｜"
+        f"回踩可開 {len(open_rows)}｜再確認 {len(confirm_rows)}｜不要進 {len(blocked_rows)}｜"
+        f"鏈上已驗證 {sum(1 for item in report_rows if item.get('onchain_verified'))}"
+    )
+    lines.append("市值與市值排名不參與准入、評分或排序。")
+    report_text = "\n".join(lines)
+
+    if persist:
+        save_wgl_report_event(report_rows, report_text)
+        mark_wgl_report_seen(report_rows, seen_symbols)
+        update_wgl_signal_outcomes(composite_rows, ranked)
+        save_latest_wgl_report(report_text, report_rows, len(structured))
+    return report_text
+
+
 def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, Any]]] | None = None) -> str:
     history = history or RUNTIME_SPIKE_HISTORY
     symbol = normalize_symbol(raw_symbol)
@@ -3998,7 +5043,11 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
         decision, decision_reason = report_decision(row, metrics, score)
 
     try:
-        onchain_signal = analyze_onchain(row.symbol, market_symbol=row.market_symbol or symbol.removesuffix("USDT"))
+        onchain_signal = analyze_onchain(
+            row.symbol,
+            market_symbol=row.market_symbol or symbol.removesuffix("USDT"),
+            provider_id=getattr(row, "provider_id", None),
+        )
     except Exception as exc:
         onchain_signal = None
         onchain_error = str(exc)
@@ -4079,7 +5128,7 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
         if launch_error:
             risks.append(f"起漲檢查錯誤：{launch_error}")
 
-    if onchain_signal:
+    if onchain_signal and onchain_signal.identity_verified:
         if onchain_signal.score >= strategy_onchain_min_score():
             positives.append(f"鏈上/DEX 分數達標：{onchain_signal.verdict} {onchain_signal.score:+d}。")
         else:
@@ -4098,6 +5147,8 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
                 risks.append("；".join(negative_reasons[:2]))
             elif onchain_signal.score < strategy_onchain_min_score():
                 risks.append("；".join(onchain_signal.reasons[:2]))
+    elif onchain_signal:
+        risks.append("鏈上合約地址尚未驗證，DEX 資料只作參考且不計分。")
     else:
         risks.append(f"鏈上檢查失敗：{onchain_error}")
 
@@ -4122,11 +5173,6 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
     elif orderbook_enabled():
         risks.append(f"訂單簿檢查失敗：{orderbook_error}")
 
-    if oi_to_mcap is not None:
-        if strategy_min_oi_to_mcap_pct() <= oi_to_mcap <= strategy_max_oi_to_mcap_pct():
-            positives.append(f"OI/市值在策略區間：{fmt_pct(oi_to_mcap)}。")
-        else:
-            risks.append(f"OI/市值不在策略區間：{fmt_pct(oi_to_mcap)}。")
     if funding is not None:
         if abs(funding) <= strategy_max_funding_pct():
             positives.append(f"Funding 未過熱：{fmt_pct(funding, 4)}。")
@@ -4139,7 +5185,11 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
         decision == "不要進"
         or (wgl_setup is not None and wgl_setup.get("action") == "不要進")
         or (funding is not None and abs(funding) > strategy_max_funding_pct())
-        or (onchain_signal is not None and onchain_signal.score < strategy_onchain_min_score())
+        or (
+            onchain_signal is not None
+            and onchain_signal.identity_verified
+            and onchain_signal.score < strategy_onchain_min_score()
+        )
     )
     orderbook_ok = bool(orderbook_signal and orderbook_signal.score >= orderbook_min_score())
     if hard_block:
@@ -4148,13 +5198,25 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
         conclusion = "埋伏：WGL底部吸籌"
     elif wgl_setup and wgl_setup.get("action") == "再確認偏強":
         conclusion = f"再確認偏強：{wgl_setup.get('stage')}"
-    elif setup and onchain_signal and onchain_signal.score >= strategy_onchain_min_score() and orderbook_ok:
+    elif (
+        setup
+        and onchain_signal
+        and onchain_signal.identity_verified
+        and onchain_signal.score >= strategy_onchain_min_score()
+        and orderbook_ok
+    ):
         conclusion = "底部吸籌共振候選"
-    elif launch_setup and onchain_signal and onchain_signal.score >= strategy_onchain_min_score() and orderbook_ok:
+    elif (
+        launch_setup
+        and onchain_signal
+        and onchain_signal.identity_verified
+        and onchain_signal.score >= strategy_onchain_min_score()
+        and orderbook_ok
+    ):
         conclusion = "起漲吸籌共振候選"
-    elif setup and onchain_signal and onchain_signal.score >= strategy_onchain_min_score():
+    elif setup and onchain_signal and onchain_signal.identity_verified and onchain_signal.score >= strategy_onchain_min_score():
         conclusion = "底部籌碼候選"
-    elif launch_setup and onchain_signal and onchain_signal.score >= strategy_onchain_min_score():
+    elif launch_setup and onchain_signal and onchain_signal.identity_verified and onchain_signal.score >= strategy_onchain_min_score():
         conclusion = "起漲確認候選"
     else:
         conclusion = "再確認"
@@ -4199,15 +5261,25 @@ def collect_spike_alerts(
     history: dict[str, deque[dict[str, Any]]],
     last_alert_at: dict[str, float],
 ) -> list[str]:
+    global RUNTIME_SPIKE_CURSOR
     watch_symbols = resolve_watch_symbols()
     if not watch_symbols:
         return []
+    batch_size = effective_spike_batch_size(len(watch_symbols))
+    start = RUNTIME_SPIKE_CURSOR % len(watch_symbols)
+    end = start + batch_size
+    if end <= len(watch_symbols):
+        scan_symbols_batch = watch_symbols[start:end]
+    else:
+        scan_symbols_batch = watch_symbols[start:] + watch_symbols[: end - len(watch_symbols)]
+    RUNTIME_SPIKE_CURSOR = end % len(watch_symbols)
 
     now = time.time()
     window = spike_window_seconds()
     check_seconds = spike_check_seconds()
     max_history_age = window + max(120, check_seconds * 4)
     max_history_age = max(max_history_age, report_lookback_seconds() + max(300, check_seconds * 4))
+    max_history_age = max(max_history_age, trend_window_seconds() + max(300, check_seconds * 4))
     max_history_age = max(max_history_age, strategy_base_window_seconds() + max(600, check_seconds * 4))
     min_pct = spike_min_change_pct()
     min_usd = spike_min_value_usd()
@@ -4217,7 +5289,7 @@ def collect_spike_alerts(
 
     rows = [
         row
-        for row in get_oi_snapshots(watch_symbols, max_workers=oi_snapshot_workers())
+        for row in get_oi_snapshots(scan_symbols_batch, max_workers=oi_snapshot_workers())
         if row.oi_value_usd is not None
     ]
     alerts: list[str] = []
@@ -4238,75 +5310,135 @@ def collect_spike_alerts(
         while samples and now - float(samples[0]["ts"]) > max_history_age:
             samples.popleft()
 
-        baseline = None
-        target_ts = now - window
-        for old in samples:
-            if float(old["ts"]) <= target_ts:
-                baseline = old
-            else:
-                break
-        if baseline is None:
+        def find_baseline(window_seconds: int) -> dict[str, Any] | None:
+            target_ts = now - window_seconds
+            found = None
+            for old in samples:
+                if float(old["ts"]) <= target_ts:
+                    found = old
+                else:
+                    break
+            return found
+
+        short_triggered = False
+        baseline = find_baseline(window)
+        if baseline is not None:
+            old_value = to_float(baseline.get("oi_value_usd"))
+            new_value = to_float(sample.get("oi_value_usd"))
+            old_contracts = to_float(baseline.get("open_interest"))
+            new_contracts = to_float(sample.get("open_interest"))
+            old_price = to_float(baseline.get("mark_price"))
+            new_price = to_float(sample.get("mark_price"))
+            change_usd = new_value - old_value if new_value is not None and old_value is not None else None
+            change_pct = pct_change(new_value, old_value)
+            contracts_pct = pct_change(new_contracts, old_contracts)
+            price_pct = pct_change(new_price, old_price)
+            spike_key = f"spike:{row.symbol}"
+            spike_ready = bool(
+                change_pct is not None
+                and change_pct >= min_pct
+                and change_usd is not None
+                and change_usd >= min_usd
+                and contracts_pct is not None
+                and contracts_pct >= min_contracts_pct
+                and now - last_alert_at.get(spike_key, last_alert_at.get(row.symbol, 0.0)) >= cooldown
+            )
+            if spike_ready:
+                last_alert_at[spike_key] = now
+                regime = classify_spike_regime(price_pct, contracts_pct, price_confirm_pct)
+                grade = classify_spike_grade(
+                    change_pct,
+                    contracts_pct,
+                    price_pct,
+                    min_pct,
+                    min_contracts_pct,
+                    price_confirm_pct,
+                )
+                event = {
+                    "event_type": "oi_spike_180s",
+                    "timestamp_utc": row.timestamp_utc,
+                    "symbol": row.symbol,
+                    "regime": regime,
+                    "grade": grade,
+                    "window_seconds": window,
+                    "old_oi_value_usd": old_value,
+                    "new_oi_value_usd": new_value,
+                    "change_usd": change_usd,
+                    "change_pct": change_pct,
+                    "contracts_change_pct": contracts_pct,
+                    "price_change_pct": price_pct,
+                    "old_open_interest": old_contracts,
+                    "new_open_interest": new_contracts,
+                    "mark_price": row.mark_price,
+                    "funding_rate_pct": row.funding_rate_pct,
+                    "market_rank": row.market_rank,
+                    "marketcap_usd": row.marketcap_usd,
+                    "watch_source": watch_source_description(),
+                }
+                save_spike_event(event)
+                alerts.append(
+                    f"OI 爆量提醒 [{grade}] {regime}\n"
+                    f"{row.symbol} 在 {window} 秒內觸發\n"
+                    f"OI價值：${fmt_num(old_value)} -> ${fmt_num(new_value)} "
+                    f"({change_pct:+.2f}%, +${fmt_num(change_usd)})\n"
+                    f"合約OI：{fmt_num(old_contracts)} -> {fmt_num(new_contracts)} ({fmt_pct(contracts_pct)})\n"
+                    f"價格變化：{fmt_pct(price_pct)}\n"
+                    f"標記價格：{fmt_num(row.mark_price, 5)} | Funding：{fmt_pct(row.funding_rate_pct, 4)}\n"
+                    f"門檻：OI價值 +{min_pct:.2f}% / +${fmt_num(min_usd)}，合約OI +{min_contracts_pct:.2f}%"
+                )
+                short_triggered = True
+
+        if short_triggered:
             continue
 
-        old_value = float(baseline["oi_value_usd"])
-        new_value = float(sample["oi_value_usd"])
-        if old_value <= 0 or new_value <= old_value:
+        trend_baseline = find_baseline(trend_window_seconds())
+        if trend_baseline is None:
             continue
-        change_usd = new_value - old_value
-        change_pct = change_usd / old_value * 100.0
-        old_contracts = baseline.get("open_interest")
-        new_contracts = sample.get("open_interest")
-        contracts_pct = None
-        if old_contracts is not None and new_contracts is not None and float(old_contracts) > 0:
-            contracts_pct = (float(new_contracts) - float(old_contracts)) / float(old_contracts) * 100.0
-        old_price = baseline.get("mark_price")
-        new_price = sample.get("mark_price")
-        price_pct = None
-        if old_price is not None and new_price is not None and float(old_price) > 0:
-            price_pct = (float(new_price) - float(old_price)) / float(old_price) * 100.0
+        trend_contracts_pct = pct_change(
+            to_float(sample.get("open_interest")),
+            to_float(trend_baseline.get("open_interest")),
+        )
+        trend_price_pct = pct_change(
+            to_float(sample.get("mark_price")),
+            to_float(trend_baseline.get("mark_price")),
+        )
+        structure = (RUNTIME_STRUCTURE_CACHE.get(row.symbol) or {}).get("screen") or {}
+        trend_signal = classify_oi_trend_signal(
+            contracts_1h_pct=trend_contracts_pct,
+            price_1h_pct=trend_price_pct,
+            oi_value_usd=to_float(sample.get("oi_value_usd")),
+            funding_rate_pct=to_float(sample.get("funding_rate_pct")),
+            structure=structure,
+        )
+        trend_key = f"trend:{row.symbol}"
+        if trend_signal is None or now - last_alert_at.get(trend_key, 0.0) < trend_cooldown_seconds():
+            continue
 
-        if change_pct < min_pct or change_usd < min_usd:
-            continue
-        if contracts_pct is None or contracts_pct < min_contracts_pct:
-            continue
-        if now - last_alert_at.get(row.symbol, 0.0) < cooldown:
-            continue
-
-        last_alert_at[row.symbol] = now
-        regime = classify_spike_regime(price_pct, contracts_pct, price_confirm_pct)
-        grade = classify_spike_grade(change_pct, contracts_pct, price_pct, min_pct, min_contracts_pct, price_confirm_pct)
+        last_alert_at[trend_key] = now
+        structure_score = int(structure.get("score") or 0)
         event = {
+            "event_type": "oi_trend_1h",
             "timestamp_utc": row.timestamp_utc,
             "symbol": row.symbol,
-            "regime": regime,
-            "grade": grade,
-            "window_seconds": window,
-            "old_oi_value_usd": old_value,
-            "new_oi_value_usd": new_value,
-            "change_usd": change_usd,
-            "change_pct": change_pct,
-            "contracts_change_pct": contracts_pct,
-            "price_change_pct": price_pct,
-            "old_open_interest": old_contracts,
-            "new_open_interest": new_contracts,
+            "signal_type": trend_signal["signal_type"],
+            "lane": trend_signal["lane"],
+            "window_seconds": trend_window_seconds(),
+            "contracts_change_pct": trend_contracts_pct,
+            "price_change_pct": trend_price_pct,
             "mark_price": row.mark_price,
+            "oi_value_usd": row.oi_value_usd,
             "funding_rate_pct": row.funding_rate_pct,
-            "market_rank": row.market_rank,
-            "marketcap_usd": row.marketcap_usd,
-            "watch_source": watch_source_description(),
+            "structure_score": structure_score,
+            "structure_eligible": bool(structure.get("eligible")),
+            "action": trend_signal["action"],
         }
         save_spike_event(event)
         alerts.append(
-            f"OI 爆量提醒 [{grade}] {regime}\n"
-            f"{row.symbol} 在 {window} 秒內觸發"
-            + (f" | 市值排名 #{row.market_rank}" if row.market_rank else "")
-            + "\n"
-            f"OI價值：${fmt_num(old_value)} -> ${fmt_num(new_value)} "
-            f"({change_pct:+.2f}%, +${fmt_num(change_usd)})\n"
-            f"合約OI：{fmt_num(old_contracts)} -> {fmt_num(new_contracts)} ({fmt_pct(contracts_pct)})\n"
-            f"價格變化：{fmt_pct(price_pct)}\n"
-            f"標記價格：{fmt_num(row.mark_price, 5)} | Funding：{fmt_pct(row.funding_rate_pct, 4)}\n"
-            f"門檻：OI價值 +{min_pct:.2f}% / +${fmt_num(min_usd)}，合約OI +{min_contracts_pct:.2f}%"
+            f"1H 資金點火｜{row.symbol}\n"
+            f"類型：{trend_signal['signal_type']}\n"
+            f"價格 1H：{fmt_pct(trend_price_pct)}｜合約 OI 1H：{fmt_pct(trend_contracts_pct)}\n"
+            f"結構：{structure_score}/100｜Funding：{fmt_pct(row.funding_rate_pct, 4)}｜OI ${fmt_num(row.oi_value_usd)}\n"
+            f"判定：{trend_signal['action']}"
         )
 
     return alerts
@@ -4454,30 +5586,111 @@ def remove_position(chat_id: int, args: list[str]) -> str:
     return "已移除倉位監控：\n" + "\n".join(format_position(item) for item in removed)
 
 
+def telegram_menu_commands() -> list[dict[str, str]]:
+    return [
+        {"command": "report", "description": "查看綜合前五與進場判斷"},
+        {"command": "wgl", "description": "研究單一幣種完整訊號"},
+        {"command": "entry", "description": "登記實盤倉位並啟動盯盤"},
+        {"command": "positions", "description": "查看持倉、PnL與出場狀態"},
+        {"command": "exit", "description": "停止指定倉位盯盤"},
+        {"command": "orderbook", "description": "檢查委託簿與真實成交流"},
+        {"command": "onchain", "description": "檢查鏈上與DEX多空證據"},
+        {"command": "strategy_report", "description": "查看模擬單與TP/SL績效"},
+        {"command": "alerts", "description": "開關每小時報告與即時警報"},
+        {"command": "status", "description": "查看系統與資料更新狀態"},
+        {"command": "help", "description": "查看核心指令與範例"},
+    ]
+
+
+def configure_alerts(chat_id: int, enabled: bool | None = None) -> str:
+    subscribers = load_subscribers()
+    if enabled is True:
+        subscribers.add(int(chat_id))
+        save_subscribers(subscribers)
+    elif enabled is False:
+        subscribers.discard(int(chat_id))
+        save_subscribers(subscribers)
+
+    active = int(chat_id) in subscribers
+    state = "已開啟" if active else "已關閉"
+    lines = [
+        f"通知狀態：{state}",
+        "內容：每小時綜合前五、狀態轉強、OI 爆量、持倉出場警報",
+    ]
+    lines.append("關閉方式：/alerts off" if active else "開啟方式：/alerts on")
+    return "\n".join(lines)
+
+
+def format_system_status(chat_id: int) -> str:
+    now = time.time()
+    payload: dict[str, Any] = {}
+    if WGL_LATEST_REPORT_PATH.exists():
+        try:
+            loaded = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, ValueError, TypeError):
+            payload = {}
+
+    generated_at = to_float(payload.get("generated_at"))
+    age_minutes = max(0, int((now - generated_at) / 60)) if generated_at else None
+    generated_local = str(payload.get("generated_local") or "尚無報告")
+    age_text = f"{age_minutes} 分鐘前" if age_minutes is not None else "尚無資料"
+    next_due = initial_report_due_at(now)
+    next_report_text = "等待掃描" if next_due <= now + 2 else time.strftime("%m/%d %H:%M", time.localtime(next_due))
+
+    universe_value = to_float(payload.get("universe_size"))
+    universe_size = int(universe_value) if universe_value is not None else 0
+    raw_symbols = payload.get("symbols") or []
+    top_symbols = [str(symbol).upper() for symbol in raw_symbols if symbol] if isinstance(raw_symbols, list) else []
+    top_text = "、".join(top_symbols[:5]) or "尚無"
+
+    batch_size = effective_spike_batch_size(universe_size)
+    coverage_seconds = (
+        math.ceil(universe_size / batch_size) * spike_check_seconds()
+        if universe_size > 0 and batch_size > 0
+        else None
+    )
+    coverage_text = f"約 {coverage_seconds} 秒覆蓋全市場" if coverage_seconds is not None else "等待市場清單"
+    manual_positions = sum(
+        1 for position in load_positions() if int(position.get("chat_id", 0)) == int(chat_id)
+    )
+    strategy_positions = len(load_strategy_positions())
+    alerts_state = "開" if int(chat_id) in load_subscribers() else "關"
+    uptime_minutes = max(0, int((now - BOT_STARTED_AT) / 60))
+
+    return "\n".join(
+        [
+            "系統狀態｜運行中",
+            f"通知：{alerts_state}｜本次運行：{uptime_minutes} 分鐘",
+            f"最新報告：{generated_local}（{age_text}）",
+            f"下次完整掃描：{next_report_text}",
+            f"市場：{universe_size or '-'} 合約｜市值條件：無",
+            f"目前前五：{top_text}",
+            f"OI 雷達：每 {spike_check_seconds()} 秒輪巡｜{coverage_text}｜含 1H 資金點火",
+            f"委託簿：{orderbook_watch_candidates()} 檔／{orderbook_collect_interval_seconds()} 秒",
+            f"V3 策略：每 {strategy_scan_interval_seconds() // 60} 分鐘｜手動盯盤 {manual_positions}｜模擬單 {strategy_positions}",
+        ]
+    )
+
+
 def help_text() -> str:
     return (
-        "OI 機器人指令\n"
-        "/oi BTC - 分析單一幣種 OI\n"
-        "/report - 回傳 WGL 妖幣劇本綜合前五\n"
-        "/oi_report - 回傳舊版 OI 注意力前 20 名與 Excel\n"
-        "/entry OPN 0.244 - 登記已進場多單並即時盯盤\n"
-        "/entry OPN short 0.244 - 登記已進場空單\n"
-        "/exit OPN - 手動移除倉位監控\n"
-        "/positions - 查看目前盯盤倉位\n"
-        "/strategy_report - 查看日線長底部 TP/SL 策略\n"
-        "/strategy_settings - 查看策略 TP/SL 與回報間隔\n"
-        "/onchain COAI - 檢查鏈上/DEX 多空分數\n"
-        "/onchain_report - 查看每小時底部/起漲雷達\n"
-        "/orderbook COAI - 查看訂單簿吸籌指紋\n"
-        "/wgl COAI - 查看 WGL 妖幣階段判斷\n"
-        "/thesis COAI - 產生交易論證卡\n"
-        "/universe - 查看目前動態監控標的數量\n"
-        "/subscribe - 訂閱每小時報表與 OI 爆量提醒\n"
-        "/unsubscribe - 取消訂閱\n"
-        "/spike_settings - 查看爆量提醒門檻\n"
-        "/scan 20 - 掃描成交量前 20 的合約\n"
-        "/help - 顯示說明\n\n"
-        "訊號邏輯會優先看合約 OI 是否真的增加，再用價格方向與 funding 判斷多空擁擠。"
+        "核心操作\n"
+        "/report - 綜合前五與進場判斷\n"
+        "/wgl COAI - 單幣完整研究卡\n"
+        "/orderbook COAI - 委託簿與真實成交流\n"
+        "/onchain COAI - 鏈上與 DEX 證據\n\n"
+        "實盤盯盤\n"
+        "/entry OPN 0.244 - 登記多單\n"
+        "/entry OPN short 0.244 - 登記空單\n"
+        "/positions - 持倉與 PnL\n"
+        "/exit OPN - 停止盯盤\n\n"
+        "通知與績效\n"
+        "/strategy_report - 模擬單與 TP/SL 績效\n"
+        "/alerts on 或 /alerts off - 通知開關\n"
+        "/status - 系統與資料更新狀態\n\n"
+        "舊指令仍可使用，但不再佔用選單。"
     )
 
 
@@ -4485,6 +5698,23 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
     command, args = split_command(text)
     if command in {"/start", "/help"}:
         return help_text()
+
+    if command == "/status":
+        if chat_id is None:
+            return "此指令只能在 Telegram 使用。"
+        return format_system_status(int(chat_id))
+
+    if command == "/alerts":
+        if chat_id is None:
+            return "此指令只能在 Telegram 使用。"
+        if not args or args[0].strip().lower() in {"status", "狀態"}:
+            return configure_alerts(int(chat_id))
+        action = args[0].strip().lower()
+        if action in {"on", "1", "yes", "start", "開", "開啟"}:
+            return configure_alerts(int(chat_id), True)
+        if action in {"off", "0", "no", "stop", "關", "關閉"}:
+            return configure_alerts(int(chat_id), False)
+        return "用法：/alerts on、/alerts off 或 /alerts status"
 
     if command == "/spike_settings":
         return (
@@ -4495,7 +5725,10 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
             f"OI價值最小增加額：+${fmt_num(spike_min_value_usd())}\n"
             f"合約OI最小增幅：+{spike_min_contracts_pct():.2f}%\n"
             f"價格確認門檻：+/-{spike_price_confirm_pct():.2f}%\n"
-            f"同幣冷卻時間：{spike_cooldown_seconds()} 秒"
+            f"同幣冷卻時間：{spike_cooldown_seconds()} 秒\n"
+            f"1H 底部點火：OI +{trend_min_contracts_pct():.2f}%、價格 +{trend_min_price_pct():.2f}% 至 +{trend_max_bottom_price_pct():.2f}%\n"
+            f"1H 強勢延續：OI +{momentum_min_contracts_pct():.2f}%、價格 +{momentum_min_price_pct():.2f}%\n"
+            f"1H 通知冷卻：{trend_cooldown_seconds()} 秒"
         )
 
     if command == "/universe":
@@ -4536,13 +5769,17 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
         watch = market_context(symbol)
         market_symbol = watch.market_symbol if watch else symbol.removesuffix("USDT")
         try:
-            signal = analyze_onchain(symbol, market_symbol=market_symbol)
+            signal = analyze_onchain(
+                symbol,
+                market_symbol=market_symbol,
+                provider_id=watch.provider_id if watch else None,
+            )
         except Exception as exc:
             return f"鏈上檢查失敗：{exc}"
         return format_onchain_report(signal)
 
     if command in {"/onchain_report", "/chain_report"}:
-        return build_onchain_hourly_report(RUNTIME_SPIKE_HISTORY)
+        return load_cached_wgl_report()
 
     if command in {"/orderbook", "/book", "/ob"}:
         if not args:
@@ -4598,9 +5835,8 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
             f"起漲 24h/3d/7d 漲幅上限：{strategy_max_launch_24h_price_pct():.2f}% / {strategy_max_launch_3d_price_pct():.2f}% / {strategy_max_launch_7d_price_pct():.2f}%\n"
             f"起漲 4H 位階/24h/3d 上限：{strategy_max_launch_4h_range_position_pct():.2f}% / {strategy_max_launch_4h_24h_price_pct():.2f}% / {strategy_max_launch_4h_3d_price_pct():.2f}%\n"
             f"Funding 上限：{strategy_max_funding_pct():.4f}%\n"
-            f"市值區間：${fmt_num(strategy_min_marketcap_usd())} - ${fmt_num(strategy_max_marketcap_usd())}\n"
-            f"OI/市值區間：{strategy_min_oi_to_mcap_pct():.2f}% - {strategy_max_oi_to_mcap_pct():.2f}%\n"
-            f"鏈上最低開倉分數：{strategy_onchain_min_score():+d}\n"
+            "市值條件：無；市值與排名只顯示參考，不參與准入或評分\n"
+            f"鏈上最低開倉分數：{strategy_onchain_min_score():+d}（合約地址驗證後才計分）\n"
             f"訂單簿收集：{'開' if orderbook_enabled() else '關'}｜每 {orderbook_collect_interval_seconds()} 秒｜候選 {orderbook_watch_candidates()} 檔\n"
             f"訂單簿觀察：{orderbook_lookback_seconds()} 秒｜至少 {orderbook_min_snapshots()} 快照｜吸籌門檻 {orderbook_min_score()} 分\n"
             f"策略回報：每 {strategy_report_interval_seconds()} 秒"
@@ -4619,22 +5855,16 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
 
     if command == "/subscribe":
         if chat_id is None:
-            return "This command needs a Telegram chat."
-        subscribers = load_subscribers()
-        subscribers.add(int(chat_id))
-        save_subscribers(subscribers)
-        return "已訂閱。我會每小時回傳 WGL 綜合前五，並即時推送 OI 爆量提醒。可用 /report 立刻測試。"
+            return "此指令只能在 Telegram 使用。"
+        return configure_alerts(int(chat_id), True)
 
     if command == "/unsubscribe":
         if chat_id is None:
-            return "This command needs a Telegram chat."
-        subscribers = load_subscribers()
-        subscribers.discard(int(chat_id))
-        save_subscribers(subscribers)
-        return "已取消訂閱每小時 OI 報表與爆量提醒。"
+            return "此指令只能在 Telegram 使用。"
+        return configure_alerts(int(chat_id), False)
 
     if command == "/report":
-        return build_onchain_hourly_report(RUNTIME_SPIKE_HISTORY)
+        return load_cached_wgl_report()
 
     if command in {"/oi_report", "/old_report"}:
         report, _ = build_oi_report()
@@ -4671,8 +5901,17 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
     return "請使用 /oi BTC 或 /help。"
 
 
+def clone_history(history: dict[str, deque[dict[str, Any]]]) -> dict[str, deque[dict[str, Any]]]:
+    snapshot: dict[str, deque[dict[str, Any]]] = {}
+    for symbol, samples in list(history.items()):
+        maxlen = samples.maxlen if isinstance(samples, deque) else None
+        snapshot[str(symbol)] = deque((dict(item) for item in list(samples)), maxlen=maxlen)
+    return snapshot
+
+
 def run_bot() -> None:
     load_env(ROOT / ".env")
+    RUNTIME_STRUCTURE_CACHE.update(load_structure_cache())
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is missing. Copy .env.example to .env and fill it.")
@@ -4683,36 +5922,17 @@ def run_bot() -> None:
         "setMyCommands",
         {
             "commands": json.dumps(
-                [
-                    {"command": "oi", "description": "分析單一幣種 OI"},
-                    {"command": "report", "description": "動態注意力前 20 名"},
-                    {"command": "entry", "description": "登記已進場倉位並即時盯盤"},
-                    {"command": "exit", "description": "移除倉位監控"},
-                    {"command": "positions", "description": "查看目前盯盤倉位"},
-                    {"command": "position_settings", "description": "查看倉位盯盤規則"},
-                    {"command": "strategy_report", "description": "查看日線長底部 TP/SL 策略"},
-                    {"command": "strategy_settings", "description": "查看策略 TP/SL 設定"},
-                    {"command": "onchain", "description": "檢查鏈上/DEX 多空分數"},
-                    {"command": "onchain_report", "description": "查看底部/起漲雷達"},
-                    {"command": "orderbook", "description": "查看訂單簿吸籌指紋"},
-                    {"command": "thesis", "description": "產生交易論證卡"},
-                    {"command": "universe", "description": "查看動態監控清單"},
-                    {"command": "subscribe", "description": "訂閱每小時報表與爆量提醒"},
-                    {"command": "unsubscribe", "description": "取消訂閱"},
-                    {"command": "spike_settings", "description": "查看 OI 爆量門檻"},
-                    {"command": "scan", "description": "掃描高成交合約 OI"},
-                    {"command": "help", "description": "顯示說明"},
-                ],
+                telegram_menu_commands(),
                 separators=(",", ":"),
             )
         },
     )
 
     subscribers = load_subscribers()
-    offset = 0
-    next_report_at = time.time() + report_interval_seconds()
+    offset = initialize_update_offset(token)
+    next_report_at = initial_report_due_at()
     next_strategy_report_at = time.time() + strategy_report_interval_seconds()
-    next_onchain_report_at = time.time() + onchain_report_interval_seconds()
+    next_strategy_scan_at = time.time() + strategy_scan_interval_seconds()
     next_spike_check_at = time.time() + 5
     next_position_check_at = time.time() + 5
     next_orderbook_collect_at = time.time() + 3
@@ -4721,6 +5941,12 @@ def run_bot() -> None:
     last_spike_alert_at: dict[str, float] = {}
     last_strategy_signal_at: dict[str, float] = {}
     daily_summary_state = load_wgl_daily_summary_state()
+    report_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wgl-report")
+    maintenance_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="orderbook")
+    strategy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy")
+    report_future: Future[str] | None = None
+    orderbook_future: Future[tuple[int, int]] | None = None
+    strategy_future: Future[list[str]] | None = None
     print("OI bot polling started. Press Ctrl+C to stop.", flush=True)
     while True:
         try:
@@ -4749,25 +5975,48 @@ def run_bot() -> None:
                     reply = f"Bot error: {exc}"
                 send_long_message(token, int(chat_id), reply)
 
-            if time.time() >= next_orderbook_collect_at:
+            if orderbook_future is not None and orderbook_future.done():
                 try:
-                    collect_orderbook_cycle(spike_history)
+                    orderbook_future.result()
                 except Exception as exc:
                     print(f"Orderbook collect cycle error: {exc}", file=sys.stderr, flush=True)
+                orderbook_future = None
+            if (
+                time.time() >= next_orderbook_collect_at
+                and orderbook_future is None
+                and report_future is None
+                and time.time() < next_report_at
+            ):
+                orderbook_future = maintenance_executor.submit(collect_orderbook_cycle, clone_history(spike_history))
                 next_orderbook_collect_at = time.time() + orderbook_collect_interval_seconds()
 
-            if time.time() >= next_report_at:
+            if report_future is not None and report_future.done():
+                try:
+                    report = report_future.result()
+                except Exception as exc:
+                    report = ""
+                    next_report_at = min(next_report_at, time.time() + 120)
+                    print(f"每小時全市場掃描失敗：{exc}", file=sys.stderr, flush=True)
                 subscribers = load_subscribers()
-                if subscribers:
-                    try:
-                        report = build_onchain_hourly_report(spike_history)
-                    except Exception as exc:
-                        report = f"Hourly WGL report failed: {exc}"
+                if report:
                     for chat_id in subscribers:
                         try:
                             send_long_message(token, int(chat_id), report)
                         except Exception as exc:
                             print(f"Report send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
+                for alert in consume_wgl_transition_alerts():
+                    for chat_id in subscribers:
+                        try:
+                            send_long_message(token, int(chat_id), alert)
+                        except Exception as exc:
+                            print(f"Transition send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
+                report_future = None
+            if time.time() >= next_report_at and report_future is None:
+                report_future = report_executor.submit(
+                    build_onchain_hourly_report,
+                    clone_history(spike_history),
+                    persist=True,
+                )
                 next_report_at = time.time() + report_interval_seconds()
 
             if time.time() >= next_strategy_report_at:
@@ -4780,20 +6029,6 @@ def run_bot() -> None:
                         except Exception as exc:
                             print(f"Strategy report send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 next_strategy_report_at = time.time() + strategy_report_interval_seconds()
-
-            if time.time() >= next_onchain_report_at:
-                subscribers = load_subscribers()
-                if subscribers:
-                    try:
-                        report = build_onchain_hourly_report(spike_history)
-                    except Exception as exc:
-                        report = f"Hourly on-chain/RAVE-LAB report failed: {exc}"
-                    for chat_id in subscribers:
-                        try:
-                            send_long_message(token, int(chat_id), report)
-                        except Exception as exc:
-                            print(f"On-chain report send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
-                next_onchain_report_at = time.time() + onchain_report_interval_seconds()
 
             if wgl_daily_summary_due(daily_summary_state):
                 summary_day = local_day_key()
@@ -4826,7 +6061,22 @@ def run_bot() -> None:
                         print(f"Position send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
                 next_position_check_at = time.time() + position_check_seconds()
 
-            if time.time() >= next_spike_check_at:
+            if strategy_future is not None and strategy_future.done():
+                try:
+                    strategy_alerts = strategy_future.result()
+                except Exception as exc:
+                    strategy_alerts = []
+                    print(f"Strategy monitor error: {exc}", file=sys.stderr, flush=True)
+                subscribers = load_subscribers()
+                for alert in strategy_alerts:
+                    for chat_id in subscribers:
+                        try:
+                            send_long_message(token, int(chat_id), alert)
+                        except Exception as exc:
+                            print(f"Strategy send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
+                strategy_future = None
+
+            if time.time() >= next_spike_check_at and report_future is None and orderbook_future is None:
                 subscribers = load_subscribers()
                 if subscribers:
                     try:
@@ -4840,19 +6090,18 @@ def run_bot() -> None:
                                 send_long_message(token, int(chat_id), alert)
                             except Exception as exc:
                                 print(f"Spike send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
-                    try:
-                        strategy_alerts = collect_strategy_alerts(spike_history, last_strategy_signal_at)
-                    except Exception as exc:
-                        strategy_alerts = []
-                        print(f"Strategy monitor error: {exc}", file=sys.stderr, flush=True)
-                    for alert in strategy_alerts:
-                        for chat_id in subscribers:
-                            try:
-                                send_long_message(token, int(chat_id), alert)
-                            except Exception as exc:
-                                print(f"Strategy send error for {chat_id}: {exc}", file=sys.stderr, flush=True)
+                    if strategy_future is None and time.time() >= next_strategy_scan_at:
+                        strategy_future = strategy_executor.submit(
+                            collect_strategy_alerts,
+                            clone_history(spike_history),
+                            last_strategy_signal_at,
+                        )
+                        next_strategy_scan_at = time.time() + strategy_scan_interval_seconds()
                 next_spike_check_at = time.time() + spike_check_seconds()
         except KeyboardInterrupt:
+            report_executor.shutdown(wait=False, cancel_futures=True)
+            maintenance_executor.shutdown(wait=False, cancel_futures=True)
+            strategy_executor.shutdown(wait=False, cancel_futures=True)
             print("Stopped.", flush=True)
             return
         except Exception as exc:

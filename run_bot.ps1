@@ -8,6 +8,8 @@ $stderr = Join-Path $logDir "bot.stderr.log"
 $botPath = Join-Path $root "bot.py"
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $existing = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -like "python*" -and $_.CommandLine -like "*$botPath*"

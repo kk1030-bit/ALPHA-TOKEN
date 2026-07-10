@@ -86,6 +86,7 @@ class OiSnapshot:
     marketcap_usd: float | None = None
     market_symbol: str | None = None
     source: str = "manual"
+    provider_id: str | None = None
 
 
 @dataclass
@@ -95,6 +96,7 @@ class WatchSymbol:
     market_rank: int | None
     marketcap_usd: float | None
     source: str
+    provider_id: str | None = None
 
 
 def normalize_symbol(text: str) -> str:
@@ -279,29 +281,45 @@ def _symbol_candidates(base_symbol: str) -> list[str]:
     ]
 
 
-def get_dynamic_watch_symbols(*, min_market_rank: int = 101) -> list[WatchSymbol]:
-    mark_symbols = {
-        symbol
-        for symbol in get_all_mark_prices()
-        if symbol.endswith("USDT")
-    }
+def _futures_base_symbol(symbol: str) -> str:
+    base = symbol.strip().upper()
+    if base.endswith("USDT"):
+        base = base[:-4]
+    for prefix in ("1000000", "10000", "1000"):
+        if base.startswith(prefix) and len(base) > len(prefix) + 1:
+            return base[len(prefix) :]
+    return base
+
+
+def get_dynamic_watch_symbols() -> list[WatchSymbol]:
+    """Return every active Binance USD-M USDT market.
+
+    CryptoBubbles is enrichment only. Rank and market cap never decide whether a
+    symbol enters the universe, so newly listed or unmapped contracts are kept.
+    """
+    mark_symbols = sorted(symbol for symbol in get_all_mark_prices() if symbol.endswith("USDT"))
+    token_by_symbol: dict[str, dict[str, Any]] = {}
+    try:
+        for token in get_crypto_bubbles_tokens(min_rank=1):
+            token_by_symbol.setdefault(str(token["symbol"]).upper(), token)
+    except Exception:
+        # Binance remains the source of truth for the tradable universe.
+        token_by_symbol = {}
+
     out: list[WatchSymbol] = []
-    seen = set()
-    for token in get_crypto_bubbles_tokens(min_rank=min_market_rank):
-        for candidate in _symbol_candidates(str(token["symbol"])):
-            if candidate not in mark_symbols or candidate in seen:
-                continue
-            out.append(
-                WatchSymbol(
-                    symbol=candidate,
-                    market_symbol=str(token["symbol"]),
-                    market_rank=int(token["rank"]),
-                    marketcap_usd=_to_float(token.get("marketcap")),
-                    source="dynamic_rank_gt_100",
-                )
+    for symbol in mark_symbols:
+        market_symbol = _futures_base_symbol(symbol)
+        token = token_by_symbol.get(market_symbol)
+        out.append(
+            WatchSymbol(
+                symbol=symbol,
+                market_symbol=market_symbol,
+                market_rank=int(token["rank"]) if token and token.get("rank") is not None else None,
+                marketcap_usd=_to_float(token.get("marketcap")) if token else None,
+                source="dynamic_all_binance_usdt",
+                provider_id=str(token.get("cg_id") or "") or None if token else None,
             )
-            seen.add(candidate)
-            break
+        )
     return out
 
 
@@ -349,6 +367,7 @@ def get_oi_snapshots(
                     marketcap_usd=watch.marketcap_usd,
                     market_symbol=watch.market_symbol,
                     source=watch.source,
+                    provider_id=watch.provider_id,
                 )
             )
 
@@ -376,6 +395,7 @@ def get_oi_snapshots(
             marketcap_usd=watch.marketcap_usd,
             market_symbol=watch.market_symbol,
             source=watch.source,
+            provider_id=watch.provider_id,
         )
 
     futures = {}
@@ -403,6 +423,7 @@ def get_oi_snapshots(
                         marketcap_usd=watch.marketcap_usd,
                         market_symbol=watch.market_symbol,
                         source=watch.source,
+                        provider_id=watch.provider_id,
                     )
                 )
 
