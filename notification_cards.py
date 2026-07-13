@@ -106,6 +106,30 @@ def _fit(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width:
     return value.rstrip() + suffix
 
 
+def _font_for_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    width: int,
+    *,
+    preferred_size: int,
+    minimum_size: int = 16,
+    bold: bool = False,
+) -> ImageFont.ImageFont:
+    value = _clean(text)
+    for size in range(preferred_size, minimum_size - 1, -1):
+        font = card_font(size, bold)
+        if draw.textlength(value, font=font) <= width:
+            return font
+    return card_font(minimum_size, bold)
+
+
+def _event_metric_widths(metrics: tuple[tuple[str, str], ...]) -> tuple[tuple[int, ...], int]:
+    labels = tuple(label for label, _ in metrics[:4])
+    if labels == ("進場區", "TP1", "TP2", "SL"):
+        return (370, 216, 216, 216), 18
+    return (252, 252, 252, 252), 24
+
+
 def _wrap(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -390,16 +414,24 @@ def render_event_card(text: str) -> bytes:
     _badge(draw, CARD_WIDTH - 64 - badge_width, 128, content.decision, font=badge_font, color=color)
 
     metric_y = 250
-    metric_width = 252
-    gap = 24
+    metric_widths, gap = _event_metric_widths(content.metrics)
+    x = 64
     for index in range(4):
-        x = 64 + index * (metric_width + gap)
+        metric_width = metric_widths[index]
         draw.rounded_rectangle((x, metric_y, x + metric_width, metric_y + 130), radius=16, fill=PANEL, outline=BORDER, width=2)
-        if index >= len(content.metrics):
-            continue
-        label, value = content.metrics[index]
-        draw.text((x + 20, metric_y + 20), _fit(draw, label, card_font(20), metric_width - 40), font=card_font(20), fill=MUTED)
-        draw.text((x + 20, metric_y + 62), _fit(draw, value, card_font(29, True), metric_width - 40), font=card_font(29, True), fill=TEXT)
+        if index < len(content.metrics):
+            label, value = content.metrics[index]
+            value_font = _font_for_width(
+                draw,
+                value,
+                metric_width - 40,
+                preferred_size=29,
+                minimum_size=16,
+                bold=True,
+            )
+            draw.text((x + 20, metric_y + 20), _fit(draw, label, card_font(20), metric_width - 40), font=card_font(20), fill=MUTED)
+            draw.text((x + 20, metric_y + 62), _clean(value), font=value_font, fill=TEXT)
+        x += metric_width + gap
 
     draw.rounded_rectangle((64, 412, CARD_WIDTH - 64, 588), radius=16, fill=PANEL_ALT, outline=BORDER, width=2)
     draw.text((88, 434), "關鍵原因", font=card_font(20, True), fill=MUTED)

@@ -5,10 +5,12 @@ import json
 import unittest
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import bot
 from notification_cards import (
+    _event_metric_widths,
+    _font_for_width,
     notification_caption,
     parse_card_content,
     parse_hourly_rows,
@@ -109,6 +111,18 @@ class NotificationCardTests(unittest.TestCase):
         image_bytes = render_notification_card(EVENT_TEXT)
         with Image.open(BytesIO(image_bytes)) as image:
             self.assertEqual(image.size, (1200, 820))
+
+    def test_trade_plan_entry_range_is_not_truncated(self) -> None:
+        value = "0.006490 - 0.006518"
+        metrics = (("進場區", value), ("TP1", "0.007261"), ("TP2", "0.007416"), ("SL", "0.006178"))
+        widths, gap = _event_metric_widths(metrics)
+        self.assertEqual(widths, (370, 216, 216, 216))
+        self.assertEqual(sum(widths) + gap * 3, 1072)
+
+        image = Image.new("RGB", (1200, 820))
+        draw = ImageDraw.Draw(image)
+        font = _font_for_width(draw, value, widths[0] - 40, preferred_size=29, minimum_size=16, bold=True)
+        self.assertLessEqual(draw.textlength(value, font=font), widths[0] - 40)
 
     def test_caption_is_short_and_actionable(self) -> None:
         caption = notification_caption(EVENT_TEXT)
