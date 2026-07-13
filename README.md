@@ -54,6 +54,10 @@ Execution liquidity is a hard trade gate. The default profile models a `5,000 US
 
 The planner publishes research levels only; it does not place live exchange orders. Existing manually registered position monitoring remains separate.
 
+The paper strategy defaults to `STRATEGY_MODE=trade_plan`. It records the report mark as the simulated fill, then evaluates closed 1-minute candles for TP1, TP2, and SL. TP1 realizes half and moves the remaining stop to entry. Statistics use `500 USDT` margin and `10x` leverage by default. Existing legacy paper positions continue to be monitored, but the legacy daily-bottom model no longer opens new positions in this mode.
+
+The experiment baseline and first recorded trade are documented in [`STRATEGY_EXPERIMENT.md`](STRATEGY_EXPERIMENT.md).
+
 This is research automation, not financial advice.
 
 ## Required Environment Variables

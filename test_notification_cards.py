@@ -76,6 +76,15 @@ SL($)：0.095｜風險 5.00%
 """
 
 
+STRATEGY_TEXT = """策略回報｜方向型 TP1 / TP2 / SL
+主策略：只採用做多/做空完整計畫｜每筆 500U × 10倍
+新模型持有 0｜已平倉 1｜勝 1｜敗 0｜累計損益 $350
+
+【新模型最近平倉】
+1. 1000XECUSDT｜TP2｜策略 +7.00%｜槓桿後 +70.00%｜350U
+"""
+
+
 class NotificationCardTests(unittest.TestCase):
     def test_hourly_report_is_condensed_into_one_ranked_card(self) -> None:
         rows = parse_hourly_rows(HOURLY_TEXT)
@@ -106,6 +115,12 @@ class NotificationCardTests(unittest.TestCase):
         self.assertIn("SKLUSDT", caption)
         self.assertIn("做多", caption)
         self.assertLessEqual(len(caption), 180)
+
+    def test_strategy_report_uses_compact_list_card(self) -> None:
+        image_bytes = render_notification_card(STRATEGY_TEXT)
+        with Image.open(BytesIO(image_bytes)) as image:
+            self.assertEqual(image.size, (1200, 400))
+        self.assertEqual(notification_caption(STRATEGY_TEXT), "策略回報｜方向型 TP1 / TP2 / SL")
 
 
 class CardDeliveryTests(unittest.TestCase):

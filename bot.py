@@ -503,6 +503,31 @@ def strategy_scan_interval_seconds() -> int:
     return env_int("STRATEGY_SCAN_INTERVAL_SECONDS", 300, 60)
 
 
+def strategy_mode() -> str:
+    value = os.environ.get("STRATEGY_MODE", "trade_plan").strip().lower()
+    return value if value in {"trade_plan", "legacy"} else "trade_plan"
+
+
+def trade_plan_paper_margin_usd() -> float:
+    return env_float("TRADE_PLAN_PAPER_MARGIN_USD", 500.0, 1.0)
+
+
+def trade_plan_paper_leverage() -> float:
+    return env_float("TRADE_PLAN_PAPER_LEVERAGE", 10.0, 1.0)
+
+
+def trade_plan_signal_max_age_seconds() -> int:
+    return env_int("TRADE_PLAN_SIGNAL_MAX_AGE_SECONDS", 1200, 60)
+
+
+def trade_plan_max_open_positions() -> int:
+    return env_int("TRADE_PLAN_MAX_OPEN_POSITIONS", 5, 1)
+
+
+def trade_plan_reentry_cooldown_seconds() -> int:
+    return env_int("TRADE_PLAN_REENTRY_COOLDOWN_SECONDS", 21600, 0)
+
+
 def strategy_take_profit_pct() -> float:
     return env_float("STRATEGY_TAKE_PROFIT_PCT", 10.0, 0.1)
 
@@ -1559,6 +1584,16 @@ def save_latest_wgl_report(report_text: str, candidates: list[dict[str, Any]], u
         "generated_local": time.strftime("%Y-%m-%d %H:%M"),
         "universe_size": universe_size,
         "symbols": [item.get("symbol") for item in candidates],
+        "items": [
+            {
+                "symbol": item.get("symbol"),
+                "report_rank": item.get("report_rank"),
+                "signal_state": item.get("signal_state"),
+                "score": item.get("score"),
+                **compact_trade_plan(item),
+            }
+            for item in candidates
+        ],
         "report_text": report_text,
     }
     WGL_LATEST_REPORT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2575,15 +2610,371 @@ def latest_history_sample(samples: deque[dict[str, Any]]) -> dict[str, Any] | No
     return sample
 
 
+TRADE_PLAN_FINAL_ACTIONS = {"PLAN_TP2", "PLAN_SL", "PLAN_BE"}
+
+
+def is_trade_plan_position(position: dict[str, Any]) -> bool:
+    return str(position.get("strategy_model") or "") == "trade_plan_v1"
+
+
+def directional_return_pct(side: str, exit_price: float | None, entry_price: float | None) -> float | None:
+    if entry_price is None or exit_price is None or entry_price <= 0:
+        return None
+    raw = (exit_price - entry_price) / entry_price * 100.0
+    return -raw if str(side).upper() == "SHORT" else raw
+
+
 def strategy_pnl_pct(position: dict[str, Any], mark_price: float | None) -> float | None:
     entry_price = to_float(position.get("entry_price"))
-    if entry_price is None or mark_price is None or entry_price <= 0:
-        return None
-    return (mark_price - entry_price) / entry_price * 100.0
+    return directional_return_pct(str(position.get("side") or "LONG"), mark_price, entry_price)
 
 
 def strategy_trade_id(symbol: str) -> str:
     return f"{symbol}-{int(time.time())}"
+
+
+def strategy_event_timestamp(event_ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(event_ts))
+
+
+def trade_plan_strategy_event(
+    position: dict[str, Any],
+    action: str,
+    *,
+    event_ts: float,
+    fill_price: float,
+    pnl_pct: float,
+    note: str = "",
+) -> dict[str, Any]:
+    leverage = to_float(position.get("leverage")) or trade_plan_paper_leverage()
+    margin_usd = to_float(position.get("margin_usd")) or trade_plan_paper_margin_usd()
+    leveraged_pnl_pct = pnl_pct * leverage
+    return {
+        "timestamp": strategy_event_timestamp(event_ts),
+        "ts": event_ts,
+        "action": action,
+        "id": position.get("id"),
+        "strategy_model": "trade_plan_v1",
+        "symbol": position.get("symbol"),
+        "side": position.get("side"),
+        "entry_phase": position.get("entry_phase"),
+        "entry_reason": position.get("entry_reason"),
+        "entry_price": position.get("entry_price"),
+        "entry_low": position.get("entry_low"),
+        "entry_high": position.get("entry_high"),
+        "take_profit_1": position.get("take_profit_1"),
+        "take_profit_2": position.get("take_profit_2"),
+        "initial_stop_loss": position.get("initial_stop_loss"),
+        "stop_loss": position.get("stop_loss"),
+        "mark_price": fill_price,
+        "fill_price": fill_price,
+        "pnl_pct": pnl_pct,
+        "leverage": leverage,
+        "leveraged_pnl_pct": leveraged_pnl_pct,
+        "margin_usd": margin_usd,
+        "pnl_usd": margin_usd * leveraged_pnl_pct / 100.0,
+        "remaining_fraction": position.get("remaining_fraction"),
+        "tp1_hit": bool(position.get("tp1_hit")),
+        "note": note,
+    }
+
+
+def trade_plan_level_hit(side: str, *, high: float, low: float, level: float, target: bool) -> bool:
+    if str(side).upper() == "SHORT":
+        return low <= level if target else high >= level
+    return high >= level if target else low <= level
+
+
+def evaluate_trade_plan_candles(
+    position: dict[str, Any],
+    klines: list[list[Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    side = str(position.get("side") or "LONG").upper()
+    entry = to_float(position.get("entry_price"))
+    tp1 = to_float(position.get("take_profit_1"))
+    tp2 = to_float(position.get("take_profit_2"))
+    stop = to_float(position.get("stop_loss"))
+    if None in {entry, tp1, tp2, stop}:
+        return [], False
+
+    events: list[dict[str, Any]] = []
+    tp1_hit = bool(position.get("tp1_hit"))
+    realized = to_float(position.get("realized_return_pct")) or 0.0
+    closed = False
+    for row in sorted(klines, key=lambda item: int(item[0])):
+        if len(row) < 5:
+            continue
+        high = to_float(row[2])
+        low = to_float(row[3])
+        if high is None or low is None:
+            continue
+        event_ts = (to_float(row[6]) or (to_float(row[0]) or 0) + 59_999) / 1000.0
+        position["last_evaluated_ms"] = int(row[0]) + 60_000
+
+        if not tp1_hit:
+            stop_hit = trade_plan_level_hit(side, high=high, low=low, level=stop, target=False)
+            tp1_now = trade_plan_level_hit(side, high=high, low=low, level=tp1, target=True)
+            if stop_hit:
+                pnl = directional_return_pct(side, stop, entry) or 0.0
+                note = "同一分鐘亦觸及TP1，依保守原則先計SL" if tp1_now else "初始止損"
+                position["remaining_fraction"] = 0.0
+                events.append(
+                    trade_plan_strategy_event(
+                        position,
+                        "PLAN_SL",
+                        event_ts=event_ts,
+                        fill_price=stop,
+                        pnl_pct=pnl,
+                        note=note,
+                    )
+                )
+                closed = True
+                break
+            if tp1_now:
+                tp1_hit = True
+                position["tp1_hit"] = True
+                position["remaining_fraction"] = 0.5
+                realized = 0.5 * (directional_return_pct(side, tp1, entry) or 0.0)
+                position["realized_return_pct"] = realized
+                position["stop_loss"] = entry
+                stop = entry
+                events.append(
+                    trade_plan_strategy_event(
+                        position,
+                        "PLAN_TP1",
+                        event_ts=event_ts,
+                        fill_price=tp1,
+                        pnl_pct=realized,
+                        note="停利一半，剩餘止損移到進場價",
+                    )
+                )
+                if trade_plan_level_hit(side, high=high, low=low, level=tp2, target=True):
+                    total = realized + 0.5 * (directional_return_pct(side, tp2, entry) or 0.0)
+                    position["remaining_fraction"] = 0.0
+                    events.append(
+                        trade_plan_strategy_event(
+                            position,
+                            "PLAN_TP2",
+                            event_ts=event_ts,
+                            fill_price=tp2,
+                            pnl_pct=total,
+                            note="同一分鐘依序穿越TP1與TP2",
+                        )
+                    )
+                    closed = True
+                    break
+                continue
+
+        tp2_hit = trade_plan_level_hit(side, high=high, low=low, level=tp2, target=True)
+        breakeven_hit = trade_plan_level_hit(side, high=high, low=low, level=stop, target=False)
+        if tp2_hit and breakeven_hit:
+            position["remaining_fraction"] = 0.0
+            events.append(
+                trade_plan_strategy_event(
+                    position,
+                    "PLAN_BE",
+                    event_ts=event_ts,
+                    fill_price=stop,
+                    pnl_pct=realized,
+                    note="同一分鐘觸及TP2與成本止損，依保守原則計成本出場",
+                )
+            )
+            closed = True
+            break
+        if tp2_hit:
+            total = realized + 0.5 * (directional_return_pct(side, tp2, entry) or 0.0)
+            position["remaining_fraction"] = 0.0
+            events.append(
+                trade_plan_strategy_event(
+                    position,
+                    "PLAN_TP2",
+                    event_ts=event_ts,
+                    fill_price=tp2,
+                    pnl_pct=total,
+                    note="TP2出清剩餘半倉",
+                )
+            )
+            closed = True
+            break
+        if breakeven_hit:
+            position["remaining_fraction"] = 0.0
+            events.append(
+                trade_plan_strategy_event(
+                    position,
+                    "PLAN_BE",
+                    event_ts=event_ts,
+                    fill_price=stop,
+                    pnl_pct=realized,
+                    note="TP1後剩餘半倉於成本出場",
+                )
+            )
+            closed = True
+            break
+
+    return events, closed
+
+
+def trade_plan_klines_since(position: dict[str, Any], *, now: float | None = None) -> list[list[Any]]:
+    current = time.time() if now is None else now
+    start_ms = int(to_float(position.get("last_evaluated_ms")) or 0)
+    if start_ms <= 0:
+        entry_ts = to_float(position.get("entry_ts")) or current
+        start_ms = (int(entry_ts * 1000) // 60_000 + 1) * 60_000
+    end_ms = int(current * 1000)
+    output: list[list[Any]] = []
+    for _ in range(20):
+        if start_ms >= end_ms:
+            break
+        rows = binance_market_json(
+            "/fapi/v1/klines",
+            {
+                "symbol": position.get("symbol"),
+                "interval": "1m",
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": 1500,
+            },
+        )
+        if not isinstance(rows, list) or not rows:
+            break
+        closed_rows = [row for row in rows if len(row) > 6 and int(row[6]) <= end_ms]
+        output.extend(closed_rows)
+        next_start = int(rows[-1][0]) + 60_000
+        if next_start <= start_ms:
+            break
+        start_ms = next_start
+        if len(rows) < 1500:
+            break
+    return output
+
+
+def latest_trade_plan_entries(
+    positions: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    now: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    current = time.time() if now is None else now
+    if not WGL_LATEST_REPORT_PATH.exists():
+        return positions, [], []
+    try:
+        payload = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return positions, [], []
+    generated_at = to_float(payload.get("generated_at"))
+    items = payload.get("items")
+    if (
+        generated_at is None
+        or generated_at > current + 60
+        or current - generated_at > trade_plan_signal_max_age_seconds()
+        or not isinstance(items, list)
+    ):
+        return positions, [], []
+
+    existing_ids = {str(item.get("id")) for item in events + positions if item.get("id")}
+    open_symbols = {
+        str(item.get("symbol") or "").upper()
+        for item in positions
+        if is_trade_plan_position(item)
+    }
+    latest_final_by_symbol: dict[str, float] = {}
+    for event in events:
+        if event.get("action") not in TRADE_PLAN_FINAL_ACTIONS:
+            continue
+        symbol = str(event.get("symbol") or "").upper()
+        latest_final_by_symbol[symbol] = max(
+            latest_final_by_symbol.get(symbol, 0.0),
+            to_float(event.get("ts")) or 0.0,
+        )
+
+    capacity = max(
+        0,
+        trade_plan_max_open_positions()
+        - sum(1 for item in positions if is_trade_plan_position(item)),
+    )
+    new_events: list[dict[str, Any]] = []
+    alerts: list[str] = []
+    for item in items:
+        if capacity <= 0 or not isinstance(item, dict):
+            break
+        decision = str(item.get("trade_decision") or "不交易")
+        side = str(item.get("trade_side") or "NONE").upper()
+        symbol = str(item.get("symbol") or "").upper()
+        trade_id = f"PLAN-{symbol}-{int(generated_at)}"
+        entry = to_float(item.get("entry_mid"))
+        entry_low = to_float(item.get("entry_low"))
+        entry_high = to_float(item.get("entry_high"))
+        tp1 = to_float(item.get("take_profit_1"))
+        tp2 = to_float(item.get("take_profit_2"))
+        stop = to_float(item.get("stop_loss"))
+        if (
+            decision not in ACTIONABLE_DECISIONS
+            or side not in {"LONG", "SHORT"}
+            or not symbol
+            or trade_id in existing_ids
+            or symbol in open_symbols
+            or None in {entry, entry_low, entry_high, tp1, tp2, stop}
+        ):
+            continue
+        last_final = latest_final_by_symbol.get(symbol, 0.0)
+        if last_final and generated_at - last_final < trade_plan_reentry_cooldown_seconds():
+            continue
+        levels_valid = (
+            stop < entry < tp1 < tp2
+            if side == "LONG"
+            else tp2 < tp1 < entry < stop
+        )
+        if not levels_valid:
+            continue
+        position = {
+            "id": trade_id,
+            "strategy_model": "trade_plan_v1",
+            "symbol": symbol,
+            "side": side,
+            "entry_ts": generated_at,
+            "entry_time": strategy_event_timestamp(generated_at),
+            "entry_price": entry,
+            "entry_low": entry_low,
+            "entry_high": entry_high,
+            "entry_phase": f"{decision}計畫",
+            "entry_reason": item.get("plan_reason"),
+            "plan_confidence": item.get("plan_confidence"),
+            "take_profit_1": tp1,
+            "take_profit_2": tp2,
+            "initial_stop_loss": stop,
+            "stop_loss": stop,
+            "risk_reward_1": item.get("risk_reward_1"),
+            "risk_reward_2": item.get("risk_reward_2"),
+            "margin_usd": trade_plan_paper_margin_usd(),
+            "leverage": trade_plan_paper_leverage(),
+            "remaining_fraction": 1.0,
+            "tp1_hit": False,
+            "realized_return_pct": 0.0,
+            "last_price": entry,
+            "last_pnl_pct": 0.0,
+            "source_report_local": payload.get("generated_local"),
+        }
+        positions.append(position)
+        open_symbols.add(symbol)
+        existing_ids.add(trade_id)
+        event = trade_plan_strategy_event(
+            position,
+            "PLAN_OPEN",
+            event_ts=generated_at,
+            fill_price=entry,
+            pnl_pct=0.0,
+            note="按每小時報告訊號價模擬成交",
+        )
+        new_events.append(event)
+        alerts.append(
+            f"策略開單｜{symbol}\n"
+            f"方向：{decision}｜進場：{fmt_num(entry, 6)}\n"
+            f"TP1：{fmt_num(tp1, 6)}｜TP2：{fmt_num(tp2, 6)}｜SL：{fmt_num(stop, 6)}\n"
+            f"模擬：{fmt_num(position['margin_usd'])}U × {fmt_num(position['leverage'])}倍｜"
+            f"信心 {int(to_float(position.get('plan_confidence')) or 0)}/100"
+        )
+        capacity -= 1
+    return positions, new_events, alerts
 
 
 def strategy_phase_result(symbol: str, history: dict[str, deque[dict[str, Any]]]) -> Any | None:
@@ -3084,6 +3475,17 @@ def format_strategy_position(position: dict[str, Any]) -> str:
     entry = to_float(position.get("entry_price"))
     last_price = to_float(position.get("last_price"))
     pnl = to_float(position.get("last_pnl_pct"))
+    if is_trade_plan_position(position):
+        side = "做空" if str(position.get("side")).upper() == "SHORT" else "做多"
+        leverage = to_float(position.get("leverage")) or trade_plan_paper_leverage()
+        remaining = to_float(position.get("remaining_fraction")) or 0.0
+        return (
+            f"{symbol}｜{side}｜進 {fmt_num(entry, 6)}｜現 {fmt_num(last_price, 6)}｜"
+            f"浮動 {fmt_pct(pnl, 2)} / {fmt_pct((pnl or 0.0) * leverage, 2)}({fmt_num(leverage)}倍)｜"
+            f"TP1 {fmt_num(to_float(position.get('take_profit_1')), 6)}｜"
+            f"TP2 {fmt_num(to_float(position.get('take_profit_2')), 6)}｜"
+            f"SL {fmt_num(to_float(position.get('stop_loss')), 6)}｜剩餘 {remaining * 100:.0f}%"
+        )
     tp_pct = to_float(position.get("take_profit_pct")) or strategy_take_profit_pct()
     sl_pct = to_float(position.get("stop_loss_pct")) or strategy_stop_loss_pct()
     tp_price = entry * (1 + tp_pct / 100.0) if entry is not None else None
@@ -3107,6 +3509,46 @@ def collect_strategy_alerts(
 
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
+        if is_trade_plan_position(position):
+            try:
+                klines = trade_plan_klines_since(position)
+                plan_events, closed = evaluate_trade_plan_candles(position, klines)
+            except Exception as exc:
+                print(f"Trade-plan tracking error for {symbol}: {exc}", file=sys.stderr, flush=True)
+                remaining.append(position)
+                continue
+            if klines:
+                last_close = to_float(klines[-1][4])
+                position["last_price"] = last_close
+                position["last_pnl_pct"] = strategy_pnl_pct(position, last_close)
+                position["last_checked_at"] = time.time()
+                changed = True
+            for event in plan_events:
+                save_strategy_event(event)
+                action = str(event.get("action") or "")
+                label = {
+                    "PLAN_TP1": "TP1 半倉停利",
+                    "PLAN_TP2": "TP2 全部出清",
+                    "PLAN_SL": "SL 停損",
+                    "PLAN_BE": "成本保護出場",
+                }.get(action, action)
+                alerts.append(
+                    f"策略{label}｜{symbol}\n"
+                    f"成交：{fmt_num(to_float(event.get('fill_price')), 6)}｜"
+                    f"策略報酬 {fmt_pct(to_float(event.get('pnl_pct')), 2)}｜"
+                    f"{fmt_num(to_float(event.get('leverage')))}倍損益 "
+                    f"{fmt_pct(to_float(event.get('leveraged_pnl_pct')), 2)}｜"
+                    f"{fmt_num(to_float(event.get('pnl_usd')))}U\n"
+                    f"{event.get('note') or ''}"
+                )
+            if plan_events:
+                changed = True
+            if closed:
+                last_signal_at[symbol] = time.time()
+                continue
+            remaining.append(position)
+            continue
+
         sample = latest_history_sample(history.get(symbol, deque()))
         if sample is None:
             remaining.append(position)
@@ -3142,6 +3584,18 @@ def collect_strategy_alerts(
 
     positions = remaining
     open_symbols = {str(item.get("symbol", "")).upper() for item in positions}
+    if strategy_mode() == "trade_plan":
+        positions, plan_open_events, plan_alerts = latest_trade_plan_entries(
+            positions,
+            load_strategy_events(),
+        )
+        for event in plan_open_events:
+            save_strategy_event(event)
+        alerts.extend(plan_alerts)
+        if changed or plan_open_events:
+            save_strategy_positions(positions)
+        return alerts
+
     capacity = max(0, strategy_max_open_positions() - len(positions))
     if capacity <= 0:
         if changed:
@@ -3319,39 +3773,52 @@ def build_strategy_report(history: dict[str, deque[dict[str, Any]]] | None = Non
         save_strategy_positions(positions)
 
     events = load_strategy_events()
-    closed = [event for event in events if event.get("action") in {"TP", "SL"}]
-    wins = [event for event in closed if to_float(event.get("pnl_pct")) is not None and to_float(event.get("pnl_pct")) > 0]
-    losses = [event for event in closed if to_float(event.get("pnl_pct")) is not None and to_float(event.get("pnl_pct")) <= 0]
-    avg = None
-    if closed:
-        values = [to_float(event.get("pnl_pct")) for event in closed if to_float(event.get("pnl_pct")) is not None]
-        avg = sum(values) / len(values) if values else None
+    plan_positions = [item for item in positions if is_trade_plan_position(item)]
+    legacy_positions = [item for item in positions if not is_trade_plan_position(item)]
+    plan_events = [item for item in events if item.get("strategy_model") == "trade_plan_v1"]
+    closed = [item for item in plan_events if item.get("action") in TRADE_PLAN_FINAL_ACTIONS]
+    wins = [item for item in closed if (to_float(item.get("pnl_pct")) or 0.0) > 0]
+    losses = [item for item in closed if (to_float(item.get("pnl_pct")) or 0.0) <= 0]
+    returns = [to_float(item.get("pnl_pct")) for item in closed]
+    returns = [value for value in returns if value is not None]
+    avg = sum(returns) / len(returns) if returns else None
+    total_usd = sum(to_float(item.get("pnl_usd")) or 0.0 for item in closed)
 
     lines = [
-        "策略回報｜日線長底部 TP/SL",
+        "策略回報｜方向型 TP1 / TP2 / SL",
         (
-            "規則：日線低位結構 + 成交量/OI 放大才開｜"
-            f"TP +{strategy_take_profit_pct():.2f}%｜SL -{strategy_stop_loss_pct():.2f}%｜"
-            f"最多 {strategy_max_open_positions()} 檔"
+            f"主策略：只採用做多/做空完整計畫｜每筆 {fmt_num(trade_plan_paper_margin_usd())}U × "
+            f"{fmt_num(trade_plan_paper_leverage())}倍｜TP1半倉後移動SL到成本"
         ),
-        f"目前策略單：{len(positions)}｜已結束：{len(closed)}｜勝 {len(wins)}｜敗 {len(losses)}｜平均 {fmt_pct(avg, 2)}",
+        (
+            f"新模型持有 {len(plan_positions)}｜已平倉 {len(closed)}｜勝 {len(wins)}｜敗 {len(losses)}｜"
+            f"平均 {fmt_pct(avg, 2)}｜累計損益 ${fmt_num(total_usd)}"
+        ),
     ]
-    if positions:
-        lines.append("")
-        lines.append("【持有中】")
-        for position in sorted(positions, key=lambda item: to_float(item.get("last_pnl_pct")) or 0, reverse=True)[:20]:
-            lines.append(format_strategy_position(position))
+    if plan_positions:
+        lines.extend(["", "【新模型持有中】"])
+        for index, position in enumerate(
+            sorted(plan_positions, key=lambda item: to_float(item.get("last_pnl_pct")) or 0, reverse=True)[:20],
+            1,
+        ):
+            lines.append(f"{index}. {format_strategy_position(position)}")
     recent = closed[-10:]
     if recent:
-        lines.append("")
-        lines.append("【最近結束】")
-        for event in reversed(recent):
+        lines.extend(["", "【新模型最近平倉】"])
+        labels = {"PLAN_TP2": "TP2", "PLAN_SL": "SL", "PLAN_BE": "成本保護"}
+        for index, event in enumerate(reversed(recent), 1):
             lines.append(
-                f"{event.get('symbol')}｜{event.get('action')}｜PnL {fmt_pct(to_float(event.get('pnl_pct')), 2)}"
-                f"｜進 {fmt_num(to_float(event.get('entry_price')), 6)}｜出 {fmt_num(to_float(event.get('mark_price')), 6)}"
+                f"{index}. {event.get('symbol')}｜{labels.get(str(event.get('action')), event.get('action'))}｜"
+                f"策略 {fmt_pct(to_float(event.get('pnl_pct')), 2)}｜"
+                f"槓桿後 {fmt_pct(to_float(event.get('leveraged_pnl_pct')), 2)}｜"
+                f"{fmt_num(to_float(event.get('pnl_usd')))}U"
             )
-    if not positions and not recent:
-        lines.append("目前尚未有策略單。新版會等日線長底部結構成立，再用 OI/成交量確認。")
+    if not plan_positions and not recent:
+        lines.append("目前尚無新模型交易；沒有完整 TP/SL 計畫就不開單。")
+    lines.append("")
+    lines.append(f"舊策略持有 {len(legacy_positions)} 檔（只追蹤出場，已停止新增）")
+    for position in legacy_positions[:10]:
+        lines.append(f"- {format_strategy_position(position)}")
     return "\n".join(lines)
 
 
@@ -6056,7 +6523,10 @@ def format_system_status(chat_id: int) -> str:
                 f"24H成交額 >= ${fmt_num(liquidity_min_quote_volume_24h_usd())}｜"
                 f"最大滑價 {liquidity_max_slippage_pct():.2f}%"
             ),
-            f"V3 策略：每 {strategy_scan_interval_seconds() // 60} 分鐘｜手動盯盤 {manual_positions}｜模擬單 {strategy_positions}",
+            (
+                f"主策略：方向型 TP1/TP2/SL｜每 {strategy_scan_interval_seconds() // 60} 分鐘追蹤｜"
+                f"手動盯盤 {manual_positions}｜模擬單 {strategy_positions}"
+            ),
         ]
     )
 
@@ -6200,6 +6670,17 @@ def handle_text(text: str, chat_id: int | None = None) -> str:
         return build_strategy_report(RUNTIME_SPIKE_HISTORY)
 
     if command == "/strategy_settings":
+        if strategy_mode() == "trade_plan":
+            return (
+                "方向型 TP1 / TP2 / SL 模擬策略\n"
+                "訊號：只採用每小時報告中的做多或做空完整計畫\n"
+                f"每筆：{fmt_num(trade_plan_paper_margin_usd())}U × {fmt_num(trade_plan_paper_leverage())}倍\n"
+                "管理：TP1停利一半，剩餘止損移到進場價；TP2出清\n"
+                f"訊號有效：{trade_plan_signal_max_age_seconds()} 秒\n"
+                f"最多持有：{trade_plan_max_open_positions()} 檔\n"
+                f"同幣再進場冷卻：{trade_plan_reentry_cooldown_seconds()} 秒\n"
+                "舊策略：只追蹤既有單出場，不再新增"
+            )
         return (
             "階段模型 TP/SL 策略設定\n"
             "開倉框架：日線長底部，1m/5m/1h 只作輔助，不再當主因\n"

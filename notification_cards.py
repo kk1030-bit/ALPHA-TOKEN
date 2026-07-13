@@ -447,6 +447,9 @@ def render_list_card(text: str) -> bytes:
 def render_notification_card(text: str) -> bytes:
     if parse_hourly_rows(text):
         return render_hourly_card(text)
+    first_line = _clean(text.splitlines()[0] if text.splitlines() else "")
+    if first_line.startswith("策略回報"):
+        return render_list_card(text)
     numbered_rows = sum(1 for line in text.splitlines() if re.match(r"^\s*\d+\.\s*", line))
     if numbered_rows >= 2:
         return render_list_card(text)
@@ -458,5 +461,8 @@ def notification_caption(text: str) -> str:
     if rows:
         decisions = "｜".join(f"{row.symbol} {row.decision}" for row in rows[:3])
         return _clean(f"每小時資金雷達｜{decisions}")[:180]
+    first_line = _clean(text.splitlines()[0] if text.splitlines() else "")
+    if first_line.startswith("策略回報"):
+        return first_line[:180]
     content = parse_card_content(text)
     return _clean(f"{content.title}｜{content.symbol}｜{content.decision}")[:180]
