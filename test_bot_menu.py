@@ -114,6 +114,22 @@ class TelegramMenuTests(unittest.TestCase):
 
 
 class OiTrendSignalTests(unittest.TestCase):
+    def test_compact_trade_plan_is_json_serializable(self) -> None:
+        compact = bot.compact_trade_plan(
+            {
+                "trade_side": "LONG",
+                "trade_decision": "做多",
+                "entry_low": 1.0,
+                "take_profit_1": 1.1,
+                "row": SimpleNamespace(symbol="TESTUSDT"),
+                "book": SimpleNamespace(score=80),
+            }
+        )
+
+        self.assertEqual(compact["trade_decision"], "做多")
+        self.assertNotIn("row", compact)
+        json.dumps(compact, ensure_ascii=False)
+
     def test_bottom_oi_trend_is_actionable_confirmation(self) -> None:
         result = bot.classify_oi_trend_signal(
             contracts_1h_pct=5.4,
@@ -173,8 +189,8 @@ class OiTrendSignalTests(unittest.TestCase):
             1,
             {},
         )
-        self.assertEqual(result["trade_bucket"], "confirm")
-        self.assertEqual(result["trade_setup"], "流動性待確認")
+        self.assertEqual(result["trade_bucket"], "no_trade")
+        self.assertEqual(result["trade_setup"], "不交易")
 
     def test_momentum_quota_survives_structure_ranking(self) -> None:
         candidates = []

@@ -19,6 +19,7 @@ import openpyxl
 
 from notification_cards import notification_caption, render_notification_card
 from phase_signal_demo import classify_phase
+from trade_planner import ACTIONABLE_DECISIONS, build_trade_plan, calculate_4h_market_context
 from onchain_service import analyze_onchain, format_onchain_report
 from orderbook_service import (
     analyze_orderbook_accumulation,
@@ -351,6 +352,14 @@ def env_bool(name: str, default: bool) -> bool:
 
 def notification_cards_enabled() -> bool:
     return env_bool("TELEGRAM_CARD_MODE", True)
+
+
+def trade_plan_min_confidence() -> int:
+    return env_int("TRADE_PLAN_MIN_CONFIDENCE", 70, 50)
+
+
+def trade_plan_min_risk_reward() -> float:
+    return env_float("TRADE_PLAN_MIN_RISK_REWARD", 1.5, 1.0)
 
 
 def liquidity_reference_notional_usd() -> float:
@@ -1369,6 +1378,16 @@ def save_wgl_report_event(candidates: list[dict[str, Any]], report_text: str) ->
                 "trade_decision": item.get("trade_decision"),
                 "trade_setup": item.get("trade_setup"),
                 "trade_reason": item.get("trade_reason"),
+                "trade_side": item.get("trade_side"),
+                "plan_confidence": item.get("plan_confidence"),
+                "entry_low": to_float(item.get("entry_low")),
+                "entry_high": to_float(item.get("entry_high")),
+                "take_profit_1": to_float(item.get("take_profit_1")),
+                "take_profit_2": to_float(item.get("take_profit_2")),
+                "stop_loss": to_float(item.get("stop_loss")),
+                "risk_reward_1": to_float(item.get("risk_reward_1")),
+                "risk_reward_2": to_float(item.get("risk_reward_2")),
+                "plan_reason": item.get("plan_reason"),
                 "first_seen": item.get("first_seen"),
                 "wgl_score": item.get("wgl_score"),
                 "wgl_action": item.get("wgl_action") or wgl.get("action"),
@@ -1462,6 +1481,17 @@ def save_wgl_full_scan_event(
                 "liquidity_buy_slippage_pct": to_float(component.get("liquidity_buy_slippage_pct")),
                 "liquidity_sell_slippage_pct": to_float(component.get("liquidity_sell_slippage_pct")),
                 "short_squeeze": bool(component.get("short_squeeze")),
+                "trade_decision": component.get("trade_decision"),
+                "trade_side": component.get("trade_side"),
+                "plan_confidence": component.get("plan_confidence"),
+                "entry_low": to_float(component.get("entry_low")),
+                "entry_high": to_float(component.get("entry_high")),
+                "take_profit_1": to_float(component.get("take_profit_1")),
+                "take_profit_2": to_float(component.get("take_profit_2")),
+                "stop_loss": to_float(component.get("stop_loss")),
+                "risk_reward_1": to_float(component.get("risk_reward_1")),
+                "risk_reward_2": to_float(component.get("risk_reward_2")),
+                "plan_reason": component.get("plan_reason"),
                 "market_rank_reference": getattr(row, "market_rank", None),
                 "marketcap_reference_usd": to_float(getattr(row, "marketcap_usd", None)),
                 "data_points": screen.get("data_points"),
@@ -1573,6 +1603,63 @@ def load_wgl_signal_states() -> dict[str, dict[str, Any]]:
     return symbols if isinstance(symbols, dict) else {}
 
 
+def format_trade_plan_alert(symbol: str, plan: dict[str, Any], *, source: str) -> str:
+    decision = str(plan.get("trade_decision") or "不交易")
+    if decision not in ACTIONABLE_DECISIONS:
+        return ""
+    return "\n".join(
+        [
+            f"交易計畫｜{symbol}",
+            f"方向：{decision}｜信心：{int(to_float(plan.get('plan_confidence')) or 0)}/100",
+            f"進場區($)：{format_plan_price(plan.get('entry_low'))} - {format_plan_price(plan.get('entry_high'))}",
+            (
+                f"TP1($)：{format_plan_price(plan.get('take_profit_1'))}｜"
+                f"RR {float(plan.get('risk_reward_1') or 0):.2f}"
+            ),
+            (
+                f"TP2($)：{format_plan_price(plan.get('take_profit_2'))}｜"
+                f"RR {float(plan.get('risk_reward_2') or 0):.2f}"
+            ),
+            (
+                f"SL($)：{format_plan_price(plan.get('stop_loss'))}｜"
+                f"風險 {float(plan.get('stop_distance_pct') or 0):.2f}%"
+            ),
+            f"理由：{plan.get('plan_reason') or '-'}",
+            f"倉位管理：{plan.get('plan_management') or '-'}",
+            f"失效條件：{plan.get('plan_invalidation') or '-'}",
+            f"來源：{source}",
+        ]
+    )
+
+
+def compact_trade_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    numeric_fields = (
+        "plan_confidence",
+        "entry_low",
+        "entry_high",
+        "entry_mid",
+        "take_profit_1",
+        "take_profit_2",
+        "stop_loss",
+        "risk_reward_1",
+        "risk_reward_2",
+        "stop_distance_pct",
+        "take_profit_1_pct",
+        "take_profit_2_pct",
+        "long_score",
+        "short_score",
+    )
+    compact = {
+        "trade_side": str(plan.get("trade_side") or "NONE"),
+        "trade_decision": str(plan.get("trade_decision") or "不交易"),
+        "plan_reason": str(plan.get("plan_reason") or ""),
+        "plan_management": str(plan.get("plan_management") or ""),
+        "plan_invalidation": str(plan.get("plan_invalidation") or ""),
+    }
+    compact.update({field: to_float(plan.get(field)) for field in numeric_fields})
+    return compact
+
+
 def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
     states = load_wgl_signal_states()
     transitions: list[dict[str, Any]] = []
@@ -1585,6 +1672,7 @@ def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
             continue
         previous = states.get(symbol) or {}
         previous_state = str(previous.get("state") or "")
+        previous_decision = str(previous.get("trade_decision") or "不交易")
         record = {
             "state": state,
             "score": item.get("score"),
@@ -1597,11 +1685,26 @@ def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
             "liquidity_score": item.get("liquidity_score"),
             "liquidity_ready": bool(item.get("liquidity_ready")),
             "liquidity_blocked": bool(item.get("liquidity_blocked")),
+            "trade_decision": item.get("trade_decision") or "不交易",
+            "trade_side": item.get("trade_side") or "NONE",
+            "plan_confidence": item.get("plan_confidence"),
+            "entry_low": item.get("entry_low"),
+            "entry_high": item.get("entry_high"),
+            "take_profit_1": item.get("take_profit_1"),
+            "take_profit_2": item.get("take_profit_2"),
+            "stop_loss": item.get("stop_loss"),
+            "risk_reward_1": item.get("risk_reward_1"),
+            "risk_reward_2": item.get("risk_reward_2"),
+            "stop_distance_pct": item.get("stop_distance_pct"),
+            "plan_reason": item.get("plan_reason"),
+            "plan_management": item.get("plan_management"),
+            "plan_invalidation": item.get("plan_invalidation"),
             "updated_utc": now_utc,
             "updated_local": now_local,
         }
         states[symbol] = record
-        if previous_state != state:
+        decision = str(record["trade_decision"])
+        if previous_state != state or previous_decision != decision:
             transition = {
                 "timestamp_utc": now_utc,
                 "timestamp_local": now_local,
@@ -1611,26 +1714,8 @@ def update_wgl_signal_states(candidates: list[dict[str, Any]]) -> None:
                 **record,
             }
             transitions.append(transition)
-            early_ready = bool(
-                previous_state
-                and state == "資金預備"
-                and int(record.get("structure_score") or 0) >= 65
-                and int(record.get("trigger_score") or 0) >= 35
-                and int(record.get("score") or 0) >= 55
-            )
-            if (state in TRIGGER_STATES or early_ready) and bool(record.get("liquidity_ready")):
-                guidance = (
-                    "早期資金共振，先列再確認；等待短線回踩守住，不能直接追價。"
-                    if early_ready
-                    else "只在回踩進場狀態視為可執行；點火確認仍需等回踩。"
-                )
-                alert = (
-                    f"狀態升級｜{symbol}\n"
-                    f"{transition['from_state']} → {state}\n"
-                    f"結構 {record['structure_score']}｜資金 {record['capital_score']}｜"
-                    f"觸發 {record['trigger_score']}｜資料 {record['quality_score']}｜風險 {record['risk_score']}\n"
-                    f"{guidance}"
-                )
+            if decision in ACTIONABLE_DECISIONS and previous_decision != decision:
+                alert = format_trade_plan_alert(symbol, record, source=f"狀態 {previous_state or '未追蹤'} → {state}")
                 with RUNTIME_TRANSITION_LOCK:
                     RUNTIME_TRANSITION_ALERTS.append(alert)
 
@@ -1980,7 +2065,7 @@ def mark_wgl_report_seen(candidates: list[dict[str, Any]], seen: dict[str, dict[
             continue
         row = item.get("row")
         mark_price = to_float(getattr(row, "mark_price", None)) or to_float(getattr(row, "price", None))
-        direction = "不開" if item.get("trade_bucket") == "blocked" else "做多"
+        direction = wgl_card_mode(item)
         score = int(to_float(item.get("score")) or 0)
         record = seen.setdefault(
             symbol,
@@ -2063,6 +2148,16 @@ def mark_wgl_report_seen(candidates: list[dict[str, Any]], seen: dict[str, dict[
                     "trade_decision": item.get("trade_decision"),
                     "trade_setup": item.get("trade_setup"),
                     "trade_reason": item.get("trade_reason"),
+                    "trade_side": item.get("trade_side"),
+                    "plan_confidence": item.get("plan_confidence"),
+                    "entry_low": to_float(item.get("entry_low")),
+                    "entry_high": to_float(item.get("entry_high")),
+                    "take_profit_1": to_float(item.get("take_profit_1")),
+                    "take_profit_2": to_float(item.get("take_profit_2")),
+                    "stop_loss": to_float(item.get("stop_loss")),
+                    "risk_reward_1": to_float(item.get("risk_reward_1")),
+                    "risk_reward_2": to_float(item.get("risk_reward_2")),
+                    "plan_reason": item.get("plan_reason"),
                     "price": mark_price,
                     "funding_rate_pct": to_float(getattr(row, "funding_rate_pct", None)),
                     "oi_value_usd": to_float(getattr(row, "oi_value_usd", None)),
@@ -3636,6 +3731,7 @@ def wgl_recent_context(symbol: str) -> dict[str, Any]:
         "funding_rates_pct": [],
         "errors": [],
     }
+    context.update(calculate_4h_market_context([]))
 
     try:
         klines = get_klines(symbol, interval="1h", limit=30)
@@ -3669,6 +3765,12 @@ def wgl_recent_context(symbol: str) -> dict[str, Any]:
             context["volume_ratio_3h"] = recent_volume / base_volume
     except Exception as exc:
         context["errors"].append(f"kline: {exc}")
+
+    try:
+        four_h_klines = closed_klines(get_klines(symbol, interval="4h", limit=120))
+        context.update(calculate_4h_market_context(four_h_klines))
+    except Exception as exc:
+        context["errors"].append(f"4h: {exc}")
 
     try:
         oi_rows = get_oi_history(symbol, period="1h", limit=30)
@@ -4103,6 +4205,16 @@ def wgl_stage_candidate(
         "volume_ratio": volume_ratio,
         "quote_volume_1h_usd": to_float(context.get("quote_volume_1h_usd")),
         "quote_volume_3h_usd": to_float(context.get("quote_volume_3h_usd")),
+        "four_h_close": to_float(context.get("four_h_close")),
+        "four_h_atr": to_float(context.get("four_h_atr")),
+        "four_h_atr_pct": to_float(context.get("four_h_atr_pct")),
+        "four_h_ema20": to_float(context.get("four_h_ema20")),
+        "four_h_ema50": to_float(context.get("four_h_ema50")),
+        "four_h_swing_high_20": to_float(context.get("four_h_swing_high_20")),
+        "four_h_swing_low_20": to_float(context.get("four_h_swing_low_20")),
+        "four_h_swing_high_60": to_float(context.get("four_h_swing_high_60")),
+        "four_h_swing_low_60": to_float(context.get("four_h_swing_low_60")),
+        "four_h_range_position_60_pct": to_float(context.get("four_h_range_position_60_pct")),
         "range_6h_position_pct": range_6h_position,
         "range_24h_position_pct": range_24h_position,
         "drawdown_from_24h_high_pct": drawdown_from_24h_high,
@@ -4357,11 +4469,23 @@ def composite_candidate_rows(
             if reason not in deduped_reasons:
                 deduped_reasons.append(reason)
 
+        trade_plan = build_trade_plan(
+            row=row,
+            metrics=metrics,
+            structure=structure,
+            wgl=wgl,
+            book=book,
+            components=components,
+            min_confidence=trade_plan_min_confidence(),
+            min_risk_reward=trade_plan_min_risk_reward(),
+        )
+
         output.append(
             {
                 "symbol": symbol,
                 "score": components["overall_score"],
                 **components,
+                **trade_plan,
                 "labels": "、".join(dict.fromkeys(labels)),
                 "reasons": deduped_reasons[:4],
                 "row": row,
@@ -4376,6 +4500,8 @@ def composite_candidate_rows(
 
     output.sort(
         key=lambda data: (
+            data.get("plan_priority") or 0,
+            data.get("plan_confidence") or 0,
             data.get("state_priority") or 0,
             data["score"],
             data.get("structure_score") or 0,
@@ -4414,66 +4540,20 @@ def classify_wgl_trade_item(
 ) -> dict[str, Any]:
     symbol = str(item.get("symbol") or "").upper()
     first_seen = seen.get(symbol) or {}
-    state = str(item.get("signal_state") or "結構未成熟")
-    score = int(item.get("score") or 0)
-    quality = int(item.get("quality_score") or 0)
-    risk = int(item.get("risk_score") or 0)
-    notice_label = "再次出現" if first_seen else "首次通知"
-
-    if item.get("liquidity_blocked"):
-        liquidity_reason = "、".join(str(value) for value in item.get("liquidity_reasons") or [])
-        return {
-            "trade_bucket": "blocked",
-            "trade_decision": "不要進",
-            "trade_setup": "流動性不足",
-            "trade_reason": liquidity_reason or "成交額、深度或滑價未達門檻",
-            "first_seen": first_seen or None,
-        }
-    if state == "失效/派發" or risk >= 45:
-        return {
-            "trade_bucket": "blocked",
-            "trade_decision": "不要進",
-            "trade_setup": "失效/派發",
-            "trade_reason": f"風險 {risk}/100，等待重新形成底部",
-            "first_seen": first_seen or None,
-        }
-    if state == "回踩進場" and not item.get("liquidity_ready"):
-        return {
-            "trade_bucket": "confirm",
-            "trade_decision": "待確認",
-            "trade_setup": "流動性待確認",
-            "trade_reason": "結構已通過，但成交深度與滑價資料尚未完整",
-            "first_seen": first_seen or None,
-        }
-    if state == "回踩進場" and quality >= 50 and score >= 50:
+    decision = str(item.get("trade_decision") or "不交易")
+    reason = str(item.get("plan_reason") or "未通過交易計畫門檻")
+    if decision in ACTIONABLE_DECISIONS:
         return {
             "trade_bucket": "open",
-            "trade_decision": "可開單",
-            "trade_setup": "回踩確認",
-            "trade_reason": f"{notice_label}｜結構與觸發通過｜{first_signal_reason(item)}",
+            "trade_decision": decision,
+            "trade_setup": f"{decision}計畫",
+            "trade_reason": reason,
             "first_seen": first_seen or None,
         }
-    if state == "點火確認":
-        return {
-            "trade_bucket": "confirm",
-            "trade_decision": "待確認",
-            "trade_setup": "點火確認",
-            "trade_reason": "已點火但不追價，等待4H/短線回踩守住突破位",
-            "first_seen": first_seen or None,
-        }
-    if state == "資金預備":
-        return {
-            "trade_bucket": "confirm",
-            "trade_decision": "待確認",
-            "trade_setup": "資金預備",
-            "trade_reason": "底部資金開始累積，等價/OI點火或回踩確認",
-            "first_seen": first_seen or None,
-        }
-    reason = "日線仍在底部建立中" if state == "底部觀察" else "結構尚未完整"
     return {
-        "trade_bucket": "observe",
-        "trade_decision": "觀察",
-        "trade_setup": state,
+        "trade_bucket": "no_trade",
+        "trade_decision": "不交易",
+        "trade_setup": "不交易",
         "trade_reason": reason,
         "first_seen": first_seen or None,
     }
@@ -4523,14 +4603,8 @@ def wgl_card_risk(item: dict[str, Any]) -> str:
 
 
 def wgl_card_mode(item: dict[str, Any]) -> str:
-    bucket = str(item.get("trade_bucket") or "")
-    if bucket == "blocked":
-        return "不要進"
-    if bucket == "confirm":
-        return "再確認"
-    if bucket == "observe":
-        return "觀察"
-    return "可分批做多"
+    decision = str(item.get("trade_decision") or "不交易")
+    return decision if decision in ACTIONABLE_DECISIONS else "不交易"
 
 
 def wgl_card_seen_state(item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -4597,16 +4671,14 @@ def wgl_card_reasons(item: dict[str, Any]) -> str:
 
 
 def wgl_entry_condition(item: dict[str, Any]) -> str:
-    state = str(item.get("signal_state") or "")
-    if state == "回踩進場":
-        return "回踩守穩，可分批；禁止追離結構位過遠"
-    if state == "點火確認":
-        return "等回踩突破位，價/OI再次同步才進"
-    if state == "資金預備":
-        return "等4H點火或價/OI同步，不先猜突破"
-    if state == "底部觀察":
-        return "只觀察，尚未形成資金與觸發共振"
-    return "目前不進場"
+    if wgl_card_mode(item) not in ACTIONABLE_DECISIONS:
+        return "不建立倉位"
+    return f"{fmt_num(item.get('entry_low'), 6)} - {fmt_num(item.get('entry_high'), 6)}"
+
+
+def format_plan_price(value: Any) -> str:
+    number = to_float(value)
+    return "-" if number is None else fmt_num(number, 6)
 
 
 def format_wgl_liquidity(item: dict[str, Any]) -> str:
@@ -4634,8 +4706,6 @@ def format_wgl_liquidity(item: dict[str, Any]) -> str:
 
 def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, dict[str, Any]]) -> str:
     row = item["row"]
-    metrics = item.get("metrics") or {}
-    wgl = item.get("wgl") or {}
     state = wgl_card_seen_state(item, seen)
     score = int(item.get("score") or 0)
     grade = wgl_card_grade(score)
@@ -4645,26 +4715,52 @@ def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, di
     up_pct = max(move_pct or 0.0, 0.0)
     down_pct = max(-(move_pct or 0.0), 0.0)
     marketcap = to_float(getattr(row, "marketcap_usd", None))
-    short_count, trend_count = wgl_card_signal_counts(item)
+    decision = wgl_card_mode(item)
+    confidence = int(to_float(item.get("plan_confidence")) or 0)
+    plan_reason = short_text(str(item.get("plan_reason") or item.get("trade_reason") or "未通過交易門檻"), 80)
+    management = str(item.get("plan_management") or "沒有通過條件，不建立倉位")
+    invalidation = str(item.get("plan_invalidation") or plan_reason)
+    actionable = decision in ACTIONABLE_DECISIONS
+    tp1_pct = to_float(item.get("take_profit_1_pct"))
+    tp2_pct = to_float(item.get("take_profit_2_pct"))
+    stop_pct = to_float(item.get("stop_distance_pct"))
+    rr1 = to_float(item.get("risk_reward_1"))
+    rr2 = to_float(item.get("risk_reward_2"))
 
     return "\n".join(
         [
             "🟡 資金異動",
             "",
             f"幣種：{item['symbol']}",
-            f"階段：{item.get('signal_state', '-')}",
-            f"決策：{wgl_card_mode(item)}",
-            f"總分：{score}/100｜品質：{grade}｜風險：{wgl_card_risk(item)}",
+            f"方向：{decision}",
+            f"信心：{confidence}/100｜多分 {int(item.get('long_score') or 0)}｜空分 {int(item.get('short_score') or 0)}",
+            f"階段：{item.get('signal_state', '-')}｜模型總分 {score}/100｜品質 {grade}｜風險 {wgl_card_risk(item)}",
             (
                 f"結構：{item.get('structure_score', 0)}｜資金：{item.get('capital_score', 0)}｜"
                 f"觸發：{item.get('trigger_score', 0)}｜資料：{item.get('quality_score', 0)}｜"
                 f"風險分：{item.get('risk_score', 0)}"
             ),
             format_wgl_liquidity(item),
+            f"進場區($)：{wgl_entry_condition(item)}",
+            (
+                f"TP1($)：{format_plan_price(item.get('take_profit_1'))}｜報酬 {tp1_pct:.2f}%｜RR {rr1:.2f}"
+                if actionable and tp1_pct is not None and rr1 is not None
+                else "TP1($)：-"
+            ),
+            (
+                f"TP2($)：{format_plan_price(item.get('take_profit_2'))}｜報酬 {tp2_pct:.2f}%｜RR {rr2:.2f}"
+                if actionable and tp2_pct is not None and rr2 is not None
+                else "TP2($)：-"
+            ),
+            (
+                f"SL($)：{format_plan_price(item.get('stop_loss'))}｜風險 {stop_pct:.2f}%"
+                if actionable and stop_pct is not None
+                else "SL($)：-"
+            ),
+            f"理由：{plan_reason}",
+            f"倉位管理：{management}",
+            f"失效條件：{invalidation}",
             f"出現次數：第 {state['push_count']} 次",
-            f"理由：{wgl_card_reasons(item)}",
-            f"進場條件：{wgl_entry_condition(item)}",
-            "失效條件：流動性不足／Funding過熱／OI增價跌／訂單簿派發／跌破底部結構",
             f"#：{index}",
             f"首次推送：{state['first_time']}",
             f"首訊方向：{state['direction']}",
@@ -4675,8 +4771,6 @@ def format_wgl_funding_card(index: int, item: dict[str, Any], seen: dict[str, di
             f"推送後跌幅：{down_pct:.2f}%",
             "市值條件：無",
             f"市值參考：{'-' if marketcap is None else '$' + fmt_num(marketcap)}（不計分）",
-            f"短線異動：{short_count}",
-            f"趨勢異動：{trend_count}",
         ]
     )
 
@@ -5037,12 +5131,9 @@ def legacy_build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]]
         item.update(classify_wgl_trade_item(item, idx, seen_symbols))
         report_rows.append(item)
 
-    open_rows = [item for item in report_rows if item.get("trade_bucket") == "open"]
-    confirm_rows = [item for item in report_rows if item.get("trade_bucket") == "confirm"]
-    observe_rows = [item for item in report_rows if item.get("trade_bucket") == "observe"]
-    duplicate_rows = [item for item in report_rows if item.get("trade_bucket") == "duplicate"]
-    blocked_rows = [item for item in report_rows if item.get("trade_bucket") == "blocked"]
-    new_rows = [item for item in report_rows if item.get("trade_bucket") != "duplicate"]
+    long_rows = [item for item in report_rows if item.get("trade_decision") == "做多"]
+    short_rows = [item for item in report_rows if item.get("trade_decision") == "做空"]
+    no_trade_rows = [item for item in report_rows if item.get("trade_decision") == "不交易"]
 
     lines: list[str] = []
     if report_rows:
@@ -5061,8 +5152,8 @@ def legacy_build_onchain_hourly_report(history: dict[str, deque[dict[str, Any]]]
     lines.append("")
     lines.append(
         "摘要："
-        f"掃描 {len(ranked)}｜新 {len(new_rows)}｜可開 {len(open_rows)}｜待確認 {len(confirm_rows)}｜"
-        f"重複/不開 {len(duplicate_rows) + len(blocked_rows)}｜WGL {len(wgl_rows)}｜"
+        f"掃描 {len(ranked)}｜做多 {len(long_rows)}｜做空 {len(short_rows)}｜不交易 {len(no_trade_rows)}｜"
+        f"WGL {len(wgl_rows)}｜"
         f"訂單簿 {len(strong_books)}｜鏈上偏多 {len(bullish)}"
     )
     if orderbook_enabled() and orderbook_rows and not orderbook_ready:
@@ -5193,9 +5284,9 @@ def build_onchain_hourly_report(
         item.update(classify_wgl_trade_item(item, idx, seen_symbols))
         report_rows.append(item)
 
-    open_rows = [item for item in report_rows if item.get("trade_bucket") == "open"]
-    confirm_rows = [item for item in report_rows if item.get("trade_bucket") == "confirm"]
-    blocked_rows = [item for item in report_rows if item.get("trade_bucket") == "blocked"]
+    long_rows = [item for item in report_rows if item.get("trade_decision") == "做多"]
+    short_rows = [item for item in report_rows if item.get("trade_decision") == "做空"]
+    no_trade_rows = [item for item in report_rows if item.get("trade_decision") == "不交易"]
     eligible_count = sum(1 for item in structured if (item.get("structure_screen") or {}).get("eligible"))
     structure_covered = sum(
         1 for item in structured if int((item.get("structure_screen") or {}).get("data_points") or 0) > 0
@@ -5215,7 +5306,7 @@ def build_onchain_hourly_report(
         "摘要："
         f"全市場 {len(structured)}｜結構已掃 {structure_covered}｜待補 {len(structured) - structure_covered}｜"
         f"底部候選 {eligible_count}｜深度分析 {len(ranked)}｜"
-        f"回踩可開 {len(open_rows)}｜再確認 {len(confirm_rows)}｜不要進 {len(blocked_rows)}｜"
+        f"做多 {len(long_rows)}｜做空 {len(short_rows)}｜不交易 {len(no_trade_rows)}｜"
         f"鏈上已驗證 {sum(1 for item in report_rows if item.get('onchain_verified'))}"
     )
     lines.append("市值與市值排名不參與准入、評分或排序。")
@@ -5472,6 +5563,33 @@ def build_research_thesis(raw_symbol: str, history: dict[str, deque[dict[str, An
     return "\n".join(lines)
 
 
+def build_realtime_trade_plan(row: Any, metrics: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(row.symbol).upper()
+    seed_orderbook_symbol(symbol)
+    book = analyze_orderbook_accumulation(
+        symbol,
+        orderbook_db_path(),
+        lookback_seconds=orderbook_lookback_seconds(),
+        min_snapshots=orderbook_min_snapshots(),
+    )
+    structure = (RUNTIME_STRUCTURE_CACHE.get(symbol) or {}).get("screen") or {}
+    wgl = wgl_stage_candidate(row, metrics, book)
+    candidates = composite_candidate_rows(
+        [{"row": row, "metrics": metrics, "structure_screen": structure}],
+        [],
+        [],
+        [],
+        [{"row": row, "signal": book}],
+        [wgl],
+    )
+    if candidates:
+        return candidates[0]
+    return {
+        "trade_decision": "不交易",
+        "plan_reason": "即時資料不足，無法建立交易計畫",
+    }
+
+
 def collect_spike_alerts(
     history: dict[str, deque[dict[str, Any]]],
     last_alert_at: dict[str, float],
@@ -5550,6 +5668,7 @@ def collect_spike_alerts(
             contracts_pct = pct_change(new_contracts, old_contracts)
             price_pct = pct_change(new_price, old_price)
             spike_key = f"spike:{row.symbol}"
+            spike_check_key = f"spike-check:{row.symbol}"
             spike_ready = bool(
                 change_pct is not None
                 and change_pct >= min_pct
@@ -5559,9 +5678,10 @@ def collect_spike_alerts(
                 and contracts_pct >= min_contracts_pct
                 and quick_liquidity_pass(row)
                 and now - last_alert_at.get(spike_key, last_alert_at.get(row.symbol, 0.0)) >= cooldown
+                and now - last_alert_at.get(spike_check_key, 0.0) >= window
             )
             if spike_ready:
-                last_alert_at[spike_key] = now
+                last_alert_at[spike_check_key] = now
                 regime = classify_spike_regime(price_pct, contracts_pct, price_confirm_pct)
                 grade = classify_spike_grade(
                     change_pct,
@@ -5593,19 +5713,26 @@ def collect_spike_alerts(
                     "marketcap_usd": row.marketcap_usd,
                     "watch_source": watch_source_description(),
                 }
+                plan_metrics = {
+                    "contracts_180s_pct": contracts_pct,
+                    "price_180s_pct": price_pct,
+                }
+                try:
+                    trade_plan = build_realtime_trade_plan(row, plan_metrics)
+                except Exception as exc:
+                    print(f"Realtime trade plan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+                    trade_plan = {"trade_decision": "不交易", "plan_reason": "即時計畫分析失敗"}
+                event["trade_plan"] = compact_trade_plan(trade_plan)
                 save_spike_event(event)
-                alerts.append(
-                    f"OI 爆量提醒 [{grade}] {regime}\n"
-                    f"{row.symbol} 在 {window} 秒內觸發\n"
-                    f"OI價值：${fmt_num(old_value)} -> ${fmt_num(new_value)} "
-                    f"({change_pct:+.2f}%, +${fmt_num(change_usd)})\n"
-                    f"合約OI：{fmt_num(old_contracts)} -> {fmt_num(new_contracts)} ({fmt_pct(contracts_pct)})\n"
-                    f"價格變化：{fmt_pct(price_pct)}\n"
-                    f"標記價格：{fmt_num(row.mark_price, 5)} | Funding：{fmt_pct(row.funding_rate_pct, 4)}\n"
-                    f"24H成交額：${fmt_num(row.quote_volume_24h_usd)}\n"
-                    f"門檻：OI價值 +{min_pct:.2f}% / +${fmt_num(min_usd)}，合約OI +{min_contracts_pct:.2f}%"
+                alert = format_trade_plan_alert(
+                    row.symbol,
+                    trade_plan,
+                    source=f"{window}秒 OI爆量 [{grade}] {regime}",
                 )
-                short_triggered = True
+                if alert:
+                    last_alert_at[spike_key] = now
+                    alerts.append(alert)
+                    short_triggered = True
 
         if short_triggered:
             continue
@@ -5632,10 +5759,15 @@ def collect_spike_alerts(
             min_quote_volume_24h_usd=liquidity_min_quote_volume_24h_usd(),
         )
         trend_key = f"trend:{row.symbol}"
-        if trend_signal is None or now - last_alert_at.get(trend_key, 0.0) < trend_cooldown_seconds():
+        trend_check_key = f"trend-check:{row.symbol}"
+        if (
+            trend_signal is None
+            or now - last_alert_at.get(trend_key, 0.0) < trend_cooldown_seconds()
+            or now - last_alert_at.get(trend_check_key, 0.0) < window
+        ):
             continue
 
-        last_alert_at[trend_key] = now
+        last_alert_at[trend_check_key] = now
         structure_score = int(structure.get("score") or 0)
         event = {
             "event_type": "oi_trend_1h",
@@ -5654,15 +5786,25 @@ def collect_spike_alerts(
             "structure_eligible": bool(structure.get("eligible")),
             "action": trend_signal["action"],
         }
+        plan_metrics = {
+            "contracts_1h_pct": trend_contracts_pct,
+            "price_1h_pct": trend_price_pct,
+        }
+        try:
+            trade_plan = build_realtime_trade_plan(row, plan_metrics)
+        except Exception as exc:
+            print(f"Realtime trade plan error for {row.symbol}: {exc}", file=sys.stderr, flush=True)
+            trade_plan = {"trade_decision": "不交易", "plan_reason": "即時計畫分析失敗"}
+        event["trade_plan"] = compact_trade_plan(trade_plan)
         save_spike_event(event)
-        alerts.append(
-            f"1H 資金點火｜{row.symbol}\n"
-            f"類型：{trend_signal['signal_type']}\n"
-            f"價格 1H：{fmt_pct(trend_price_pct)}｜合約 OI 1H：{fmt_pct(trend_contracts_pct)}\n"
-            f"結構：{structure_score}/100｜Funding：{fmt_pct(row.funding_rate_pct, 4)}｜OI ${fmt_num(row.oi_value_usd)}\n"
-            f"24H成交額：${fmt_num(row.quote_volume_24h_usd)}｜"
-            f"判定：{trend_signal['action']}"
+        alert = format_trade_plan_alert(
+            row.symbol,
+            trade_plan,
+            source=f"1H OI點火｜{trend_signal['signal_type']}",
         )
+        if alert:
+            last_alert_at[trend_key] = now
+            alerts.append(alert)
 
     return alerts
 

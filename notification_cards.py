@@ -31,7 +31,12 @@ class SummaryRow:
     decision: str
     stage: str
     score: str
+    confidence: str
     liquidity: str
+    entry: str
+    tp1: str
+    tp2: str
+    stop_loss: str
     reason: str
 
 
@@ -82,7 +87,7 @@ def _clean(text: object) -> str:
 
 def _tone(value: str) -> str:
     text = value.upper()
-    if any(word in text for word in ("不要進", "出場", "停損", "失效", "SL", "偏空")):
+    if any(word in text for word in ("不交易", "不要進", "做空", "出場", "停損", "失效", "SL", "偏空")):
         return RED
     if any(word in text for word in ("可開", "做多", "埋伏", "TP", "停利", "多頭")):
         return GREEN
@@ -153,11 +158,16 @@ def parse_hourly_rows(text: str) -> list[SummaryRow]:
         rows.append(
             SummaryRow(
                 symbol=_clean(symbol),
-                decision=_clean(fields.get("決策", "觀察")),
-                stage=_clean(fields.get("階段", "-")),
+                decision=_clean(fields.get("方向", fields.get("決策", "不交易"))),
+                stage=_clean(fields.get("階段", "-")).split("｜", 1)[0],
                 score=_clean(total),
+                confidence=_clean(fields.get("信心", "0/100").split("｜", 1)[0]),
                 liquidity=_clean(liquidity),
-                reason=_clean(fields.get("理由", fields.get("進場條件", "等待下一輪確認"))),
+                entry=_clean(fields.get("進場區($)", "-")),
+                tp1=_clean(fields.get("TP1($)", "-").split("｜", 1)[0]),
+                tp2=_clean(fields.get("TP2($)", "-").split("｜", 1)[0]),
+                stop_loss=_clean(fields.get("SL($)", "-").split("｜", 1)[0]),
+                reason=_clean(fields.get("理由", "未通過交易門檻")),
             )
         )
     return rows[:5]
@@ -231,10 +241,12 @@ def render_hourly_card(text: str) -> bytes:
         draw.text((92, y + 18), row.symbol, font=symbol_font, fill=TEXT)
         draw.text((92, y + 68), _fit(draw, row.stage, stage_font, 260), font=stage_font, fill=MUTED)
 
-        draw.text((390, y + 20), f"總分 {row.score}", font=score_font, fill=TEXT)
+        draw.text((390, y + 20), f"信心 {row.confidence}", font=score_font, fill=TEXT)
         liquidity_color = GREEN if row.liquidity.startswith("合格") else AMBER if row.liquidity.startswith("待") else RED
-        draw.text((390, y + 58), f"流動性 {row.liquidity}", font=stage_font, fill=liquidity_color)
-        draw.text((390, y + 91), _fit(draw, row.reason, reason_font, 500), font=reason_font, fill=MUTED)
+        draw.text((570, y + 22), _fit(draw, f"流動性 {row.liquidity}", stage_font, 360), font=stage_font, fill=liquidity_color)
+        levels = f"進 {row.entry}｜TP1 {row.tp1}｜TP2 {row.tp2}｜SL {row.stop_loss}"
+        draw.text((390, y + 58), _fit(draw, levels, stage_font, 650), font=stage_font, fill=TEXT)
+        draw.text((390, y + 91), _fit(draw, row.reason, reason_font, 650), font=reason_font, fill=MUTED)
 
         badge_width = int(draw.textlength(row.decision, font=badge_font)) + 38
         _badge(draw, CARD_WIDTH - 92 - badge_width, y + 22, row.decision, font=badge_font, color=color)
@@ -246,6 +258,10 @@ def render_hourly_card(text: str) -> bytes:
 
 
 METRIC_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("進場區", r"進場區\(\$\)[：: ]+([^\n｜]+)"),
+    ("TP1", r"TP1\(\$\)[：: ]+([^\n｜]+)"),
+    ("TP2", r"TP2\(\$\)[：: ]+([^\n｜]+)"),
+    ("SL", r"SL\(\$\)[：: ]+([^\n｜]+)"),
     ("1H 價格", r"價格(?:\s*1H|1H|變化)[：: ]+([+\-−]?\d+(?:\.\d+)?%)"),
     ("1H OI", r"(?:合約\s*OI\s*1H|OI\s*1H|OI1h)[：: ]+([+\-−]?\d+(?:\.\d+)?%)"),
     ("PnL", r"PnL[：: ]+([+\-−]?\d+(?:\.\d+)?%)"),
@@ -259,6 +275,9 @@ METRIC_PATTERNS: tuple[tuple[str, str], ...] = (
 
 def _infer_decision(text: str) -> str:
     checks = (
+        ("方向：做多", "做多"),
+        ("方向：做空", "做空"),
+        ("方向：不交易", "不交易"),
         ("停損出場", "停損出場"),
         ("立即出場", "立即出場"),
         ("剩餘半倉出場", "半倉出場"),
@@ -335,9 +354,9 @@ def parse_card_content(text: str) -> CardContent:
                 break
 
     reason = _labeled_value(text, ("原因", "理由", "來源"))
-    action = _labeled_value(text, ("動作", "判定", "進場條件"))
+    action = _labeled_value(text, ("倉位管理", "動作", "判定", "進場條件"))
     if not reason:
-        reason = subtitle or "條件已觸發，等待下一步確認"
+        reason = subtitle or "未提供交易理由"
     if not action:
         action = decision
     return CardContent(

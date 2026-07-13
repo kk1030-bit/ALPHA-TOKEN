@@ -26,21 +26,21 @@ Automatic notifications use compact PNG cards by default (`TELEGRAM_CARD_MODE=1`
 
 ## WGL Report Format
 
-The hourly scanner first evaluates closed daily candles across the full universe, then runs deeper OI, funding, spot-flow, order-book, and verified on-chain checks. Deep-analysis capacity is split between long-bottom structures and a reserved live-momentum lane, so strong OI/price expansion cannot be removed by the bottom-structure ranking alone. The card separates:
+The hourly scanner first evaluates closed daily candles across the full universe, then runs deeper OI, funding, spot-flow, order-book, and verified on-chain checks. Deep-analysis capacity is split between long-bottom structures and a reserved live-momentum lane, so strong OI/price expansion cannot be removed by the bottom-structure ranking alone. Every result is reduced to `做多`, `做空`, or `不交易`. The card separates:
 
-- `階段`: `底部觀察`, `資金預備`, `點火確認`, `回踩進場`, or `失效/派發`
+- `方向 / 信心 / 多分 / 空分`
+- `進場區 / TP1 / TP2 / SL / R:R`
 - `結構 / 資金 / 觸發 / 資料完整度 / 風險`
-- `進場條件 / 失效條件`
+- `理由 / 倉位管理 / 失效條件`
 - `首次推送 / 首訊方向 / 最新推送`
 - `推送價格 / 當前幣價 / 推送後漲跌`
 - `市值條件：無`; market cap is displayed as non-scoring reference data when available
 
-Only `回踩進場` can become `可開單`. `點火確認` and `資金預備` remain `待確認`, which prevents top-rank alone from opening a trade. Repeated symbols remain eligible and are shown through history counters.
+An actionable plan requires direction agreement, complete liquidity data, valid 4-hour ATR and structure, and at least `TRADE_PLAN_MIN_RISK_REWARD` room to the nearest 4-hour support or resistance. TP1 defaults to at least `1.5R`; TP2 targets `2.5R`. After TP1, the plan takes half profit and moves the remaining stop to the average entry. Any candidate that cannot produce all prices is `不交易`. Repeated symbols remain eligible and are shown through history counters.
 
-The real-time scanner has two distinct alerts:
+The real-time scanner still detects 180-second OI spikes and 1-hour ignition events, but raw detections are persisted rather than pushed directly. Telegram receives an alert only after the same trade planner produces a complete `做多` or `做空` setup with entry, TP1, TP2, and SL.
 
-- `底部點火` / `軋空點火`: a qualified long base with synchronized 1-hour price and OI growth; wait for a short pullback before considering entry.
-- `強勢延續`: synchronized price/OI growth without a bottom structure; discovery only, explicitly not an entry or chase signal.
+Long plans require a qualified structure plus synchronized price/OI or a strong pullback reclaim. Short plans require price down with OI up, an elevated price location, a 4-hour loss of EMA20, and at least two independent confirmations from hot funding, spot selling, positive basis, or order-book distribution.
 
 Strong negative funding is treated asymmetrically: when price and OI rise together it is short-squeeze evidence, while crowded positive funding remains a long-risk block.
 
@@ -50,9 +50,9 @@ Permanent first-push statistics start at `WGL_STATS_START_DATE` (`2026-07-09` by
 
 On-chain scores count only when the DEX token address matches a verified provider contract. Symbol-only DexScreener matches are shown as reference and contribute zero points. Order-book scoring combines persistent depth with executed taker-buy/taker-sell flow to reduce spoof-wall false positives.
 
-Execution liquidity is a hard trade gate. The default profile models a `5,000 USDT` notional position and requires at least `$5M` 24-hour quote turnover, `$100K` recent 1-hour turnover when available, at least `1.5x` the reference order size on both sides within `0.5%`, spread no wider than `0.20%`, and estimated buy/sell slippage no worse than `0.30%`. A failed gate becomes `不要進`; incomplete depth data can be observed but cannot become `可開單`. Real-time OI spike and ignition alerts also require the 24-hour turnover floor.
+Execution liquidity is a hard trade gate. The default profile models a `5,000 USDT` notional position and requires at least `$5M` 24-hour quote turnover, `$100K` recent 1-hour turnover when available, at least `1.5x` the reference order size on both sides within `0.5%`, spread no wider than `0.20%`, and estimated buy/sell slippage no worse than `0.30%`. A failed or incomplete gate becomes `不交易`. Real-time OI spike and ignition alerts also require the complete trade plan, not only the turnover floor.
 
-Default trade-management assumptions: TP +10% take half, SL -7%, then move stop to entry after half take-profit.
+The planner publishes research levels only; it does not place live exchange orders. Existing manually registered position monitoring remains separate.
 
 This is research automation, not financial advice.
 
