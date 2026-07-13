@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 import json
 import math
 import os
@@ -63,6 +64,7 @@ SUBSCRIBERS_PATH = ROOT / "data" / "subscribers.json"
 POSITIONS_PATH = ROOT / "data" / "positions.json"
 STRATEGY_POSITIONS_PATH = ROOT / "data" / "strategy_positions.json"
 STRATEGY_EVENTS_PATH = ROOT / "data" / "strategy_events.jsonl"
+SPIKE_EVENTS_PATH = ROOT / "data" / "spikes"
 WGL_REPORT_EVENTS_PATH = ROOT / "data" / "wgl_reports"
 WGL_SEEN_SYMBOLS_PATH = ROOT / "data" / "wgl_seen_symbols"
 WGL_SYMBOL_STATS_PATH = ROOT / "data" / "wgl_symbol_stats.json"
@@ -1356,7 +1358,7 @@ def build_oi_report(history: dict[str, deque[dict[str, Any]]] | None = None) -> 
 
 
 def save_spike_event(event: dict[str, Any]) -> None:
-    path = ROOT / "data" / "spikes" / f"{time.strftime('%Y%m%d')}.jsonl"
+    path = SPIKE_EVENTS_PATH / f"{time.strftime('%Y%m%d')}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -2848,6 +2850,72 @@ def trade_plan_klines_since(position: dict[str, Any], *, now: float | None = Non
     return output
 
 
+def parse_event_timestamp(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def recent_trade_plan_signals(current: float) -> list[tuple[float, str, dict[str, Any]]]:
+    max_age = trade_plan_signal_max_age_seconds()
+    signals: list[tuple[float, str, dict[str, Any]]] = []
+
+    if WGL_LATEST_REPORT_PATH.exists():
+        try:
+            payload = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        generated_at = to_float(payload.get("generated_at"))
+        items = payload.get("items")
+        if (
+            generated_at is not None
+            and generated_at <= current + 60
+            and current - generated_at <= max_age
+            and isinstance(items, list)
+        ):
+            source_local = str(payload.get("generated_local") or "")
+            signals.extend(
+                (generated_at, source_local, item)
+                for item in items
+                if isinstance(item, dict)
+            )
+
+    if SPIKE_EVENTS_PATH.exists():
+        paths = sorted(SPIKE_EVENTS_PATH.glob("*.jsonl"), reverse=True)[:2]
+        for path in paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()[-2000:]
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                plan = event.get("trade_plan")
+                generated_at = parse_event_timestamp(event.get("timestamp_utc"))
+                if (
+                    not isinstance(plan, dict)
+                    or generated_at is None
+                    or generated_at > current + 60
+                    or current - generated_at > max_age
+                    or str(plan.get("trade_decision") or "") not in ACTIONABLE_DECISIONS
+                ):
+                    continue
+                item = {"symbol": event.get("symbol"), **plan}
+                source_local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(generated_at))
+                signals.append((generated_at, source_local, item))
+
+    signals.sort(key=lambda signal: signal[0])
+    return signals
+
+
 def latest_trade_plan_entries(
     positions: list[dict[str, Any]],
     events: list[dict[str, Any]],
@@ -2855,20 +2923,8 @@ def latest_trade_plan_entries(
     now: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     current = time.time() if now is None else now
-    if not WGL_LATEST_REPORT_PATH.exists():
-        return positions, [], []
-    try:
-        payload = json.loads(WGL_LATEST_REPORT_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return positions, [], []
-    generated_at = to_float(payload.get("generated_at"))
-    items = payload.get("items")
-    if (
-        generated_at is None
-        or generated_at > current + 60
-        or current - generated_at > trade_plan_signal_max_age_seconds()
-        or not isinstance(items, list)
-    ):
+    signals = recent_trade_plan_signals(current)
+    if not signals:
         return positions, [], []
 
     existing_ids = {str(item.get("id")) for item in events + positions if item.get("id")}
@@ -2894,7 +2950,7 @@ def latest_trade_plan_entries(
     )
     new_events: list[dict[str, Any]] = []
     alerts: list[str] = []
-    for item in items:
+    for generated_at, source_local, item in signals:
         if capacity <= 0 or not isinstance(item, dict):
             break
         decision = str(item.get("trade_decision") or "不交易")
@@ -2952,7 +3008,7 @@ def latest_trade_plan_entries(
             "realized_return_pct": 0.0,
             "last_price": entry,
             "last_pnl_pct": 0.0,
-            "source_report_local": payload.get("generated_local"),
+            "source_report_local": source_local,
         }
         positions.append(position)
         open_symbols.add(symbol)

@@ -161,6 +161,48 @@ class TradePlanPositionTests(unittest.TestCase):
         self.assertEqual(len(again), 1)
         self.assertEqual(repeated_events, [])
 
+    def test_realtime_spike_plan_opens_at_published_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "missing-latest.json"
+            spike_dir = Path(temp_dir) / "spikes"
+            spike_dir.mkdir()
+            (spike_dir / "20260713.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp_utc": "1970-01-01T00:17:30+00:00",
+                        "symbol": "LIVEUSDT",
+                        "trade_plan": {
+                            "trade_decision": "做多",
+                            "trade_side": "LONG",
+                            "plan_confidence": 96,
+                            "entry_low": 99.5,
+                            "entry_high": 100.5,
+                            "entry_mid": 100.0,
+                            "take_profit_1": 105.0,
+                            "take_profit_2": 108.0,
+                            "stop_loss": 96.0,
+                            "risk_reward_1": 1.5,
+                            "risk_reward_2": 2.5,
+                            "plan_reason": "realtime test",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(bot, "WGL_LATEST_REPORT_PATH", report_path),
+                patch.object(bot, "SPIKE_EVENTS_PATH", spike_dir),
+            ):
+                positions, events, alerts = bot.latest_trade_plan_entries([], [], now=1_100.0)
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["symbol"], "LIVEUSDT")
+        self.assertEqual(positions[0]["entry_price"], 100.0)
+        self.assertTrue(positions[0]["source_report_local"])
+        self.assertEqual(events[0]["action"], "PLAN_OPEN")
+        self.assertEqual(len(alerts), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
